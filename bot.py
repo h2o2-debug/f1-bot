@@ -1,23 +1,34 @@
-"""
-Telegram bot for ГО «Ф1»
-Пересылает все входящие сообщения:
-1) в рабочую группу
-2) в личные сообщения сотрудникам
+"""Telegram bot for ГО «Ф1».
 
-pip install -U python-telegram-bot==21.6
+Функції:
+- Приймає повідомлення від користувачів.
+- Просить обрати категорію звернення (кнопки).
+- Пересилає звернення:
+  1) у робочу групу (якщо налаштована)
+  2) у особисті повідомлення співробітникам (список керується командами)
+
+Встановлення:
+  pip install -U python-telegram-bot==21.6
+
+Змінні середовища:
+  TELEGRAM_BOT_TOKEN  - токен бота
+  BOT_OWNER_ID        - numeric Telegram ID власника
+  F1_BOT_DATA         - шлях до файлу даних (за замовчуванням bot_data.json)
+  ROUTING_GROUP_ID    - дефолтний ID групи (необовʼязково; можна задати /setgroup)
 """
 
 import os
 import json
 from dataclasses import dataclass, asdict
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -29,7 +40,21 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 OWNER_ID = int(os.environ.get("BOT_OWNER_ID", "0"))
 DEFAULT_GROUP_ID = int(os.environ.get("ROUTING_GROUP_ID", "0"))
 
-# ================== МОДЕЛИ ==================
+# ================== КАТЕГОРІЇ ==================
+
+CATEGORIES: List[Tuple[str, str]] = [
+    ("psy", "Психологічна підтримка"),
+    ("law", "Юридична допомога"),
+    ("edu", "Навчання / SkillsLab_F1"),
+    ("hum", "Гуманітарна допомога"),
+    ("gbv", "Насильство / Булінг"),
+    ("other", "Інше"),
+]
+
+CAT_PREFIX = "cat:"  # callback_data prefix
+
+
+# ================== МОДЕЛІ ==================
 
 @dataclass
 class StaffMember:
@@ -37,20 +62,30 @@ class StaffMember:
     username: Optional[str] = None
     name: Optional[str] = None
 
+
 # ================== УТИЛІТИ ==================
 
 def load_data() -> dict:
+    """Load persistent bot data from DATA_FILE."""
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            # backward-compatible defaults
+            data.setdefault("group_id", DEFAULT_GROUP_ID)
+            data.setdefault("staff", {})
+            return data
     return {"group_id": DEFAULT_GROUP_ID, "staff": {}}
 
+
 def save_data(data: dict) -> None:
+    """Save persistent bot data to DATA_FILE."""
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+
 def is_owner(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id == OWNER_ID)
+
 
 def parse_int(value: str):
     try:
@@ -58,24 +93,51 @@ def parse_int(value: str):
     except Exception:
         return None
 
+
 def format_user_line(member: StaffMember) -> str:
     u = f"@{member.username}" if member.username else ""
     n = member.name or ""
     extra = " ".join(x for x in [u, n] if x).strip()
     return f"- `{member.user_id}` {extra}".strip()
 
+
+def category_label_by_key(key: str) -> Optional[str]:
+    for k, lbl in CATEGORIES:
+        if k == key:
+            return lbl
+    return None
+
+
+def categories_keyboard() -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton(text=label, callback_data=f"{CAT_PREFIX}{key}")]
+        for key, label in CATEGORIES
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 # ================== КОМАНДИ ==================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Show category picker each time for simplicity
     await update.message.reply_text(
         "Вітаю! Я офіційний бот ГО «Ф1».\n\n"
-        "Напишіть мені повідомлення - я передам його команді.\n"
-        "Команди: /help"
+        "Оберіть тему звернення нижче (можна змінити будь-коли командою /category).",
+        reply_markup=categories_keyboard(),
     )
+
+
+async def cmd_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Оберіть тему звернення:",
+        reply_markup=categories_keyboard(),
+    )
+
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "Доступні команди:\n"
+        "/category - обрати/змінити категорію звернення\n"
         "/staff - список співробітників\n"
         "/addstaff <user_id> [@username] [Ім'я] - додати співробітника (тільки власник)\n"
         "/removestaff <user_id> - видалити співробітника (тільки власник)\n"
@@ -84,6 +146,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "інакше Telegram не дозволить писати йому в особисті."
     )
     await update.message.reply_text(text)
+
 
 async def cmd_setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
@@ -108,6 +171,7 @@ async def cmd_setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN,
     )
 
+
 async def cmd_staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     staff: Dict[str, dict] = data.get("staff", {})
@@ -124,6 +188,7 @@ async def cmd_staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👥 Співробітники:\n" + lines,
         parse_mode=ParseMode.MARKDOWN,
     )
+
 
 async def cmd_addstaff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
@@ -158,6 +223,7 @@ async def cmd_addstaff(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN,
     )
 
+
 async def cmd_removestaff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return await update.message.reply_text("⛔ Немає доступу.")
@@ -184,6 +250,34 @@ async def cmd_removestaff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Такого співробітника немає.")
 
+
+# ================== КАТЕГОРІЇ: CALLBACK ==================
+
+async def on_category_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+
+    data = q.data or ""
+    if not data.startswith(CAT_PREFIX):
+        return
+
+    key = data[len(CAT_PREFIX):].strip()
+    label = category_label_by_key(key)
+    await q.answer()
+
+    if not label:
+        return await q.edit_message_text("Категорія не знайдена. Спробуйте /category.")
+
+    # store choice per user in memory (context.user_data)
+    context.user_data["category_key"] = key
+    context.user_data["category_label"] = label
+
+    await q.edit_message_text(
+        f"Обрано: {label}\n\nТепер напишіть повідомлення - я передам його команді."
+    )
+
+
 # ================== ОБРОБКА ПОВІДОМЛЕНЬ ==================
 
 async def route_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -200,7 +294,11 @@ async def route_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.username:
         from_line += f" @{user.username}"
 
-    header = f"🟦 Нове звернення\n{from_line}"
+    cat_label = context.user_data.get("category_label")
+    if cat_label:
+        header = f"🟦 Нове звернення [{cat_label}]\n{from_line}"
+    else:
+        header = f"🟦 Нове звернення [Без категорії]\n{from_line}"
 
     # 1) В робочу групу
     if group_id != 0:
@@ -223,6 +321,7 @@ async def route_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await msg.reply_text("✅ Дякуємо! Повідомлення передано команді.")
 
+
 # ================== ЗАПУСК ==================
 
 def main():
@@ -235,16 +334,21 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("category", cmd_category))
+
     app.add_handler(CommandHandler("setgroup", cmd_setgroup))
     app.add_handler(CommandHandler("staff", cmd_staff))
     app.add_handler(CommandHandler("addstaff", cmd_addstaff))
     app.add_handler(CommandHandler("removestaff", cmd_removestaff))
 
-    app.add_handler(
-        MessageHandler(filters.ALL & ~filters.COMMAND, route_incoming)
+    app.add_handler(CallbackQueryHandler(on_category_pick, pattern=r"^cat:"))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, route_incoming))
+
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
     )
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES,)
 
 if __name__ == "__main__":
     main()
