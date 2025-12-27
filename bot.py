@@ -244,7 +244,7 @@ def main():
         MessageHandler(filters.ALL & ~filters.COMMAND, route_incoming)
     )
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True,close_loop=False,)
+    app.run_polling(allowed_updates=Update.ALL_TYPES,)
 
 if __name__ == "__main__":
     main()
