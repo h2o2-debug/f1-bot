@@ -37,7 +37,7 @@ class StaffMember:
     username: Optional[str] = None
     name: Optional[str] = None
 
-# ================== УТИЛИТЫ ==================
+# ================== УТИЛІТИ ==================
 
 def load_data() -> dict:
     if os.path.exists(DATA_FILE):
@@ -64,7 +64,7 @@ def format_user_line(member: StaffMember) -> str:
     extra = " ".join(x for x in [u, n] if x).strip()
     return f"- `{member.user_id}` {extra}".strip()
 
-# ================== КОМАНДЫ ==================
+# ================== КОМАНДИ ==================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -196,4 +196,55 @@ async def route_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
     staff_dict: Dict[str, dict] = data.get("staff", {})
 
     user = update.effective_user
-    from_line = f"Від: {user.full_name} (id {
+    from_line = f"Від: {user.full_name} (id {user.id})"
+    if user.username:
+        from_line += f" @{user.username}"
+
+    header = f"🟦 Нове звернення\n{from_line}"
+
+    # 1) В робочу групу
+    if group_id != 0:
+        try:
+            await context.bot.send_message(chat_id=group_id, text=header)
+            await msg.copy(chat_id=group_id)
+        except Exception:
+            await msg.reply_text(
+                "⚠️ Не вдалося передати повідомлення в робочу групу."
+            )
+
+    # 2) В особисті співробітникам
+    for v in staff_dict.values():
+        member = StaffMember(**v)
+        try:
+            await context.bot.send_message(chat_id=member.user_id, text=header)
+            await msg.copy(chat_id=member.user_id)
+        except Exception:
+            pass
+
+    await msg.reply_text("✅ Дякуємо! Повідомлення передано команді.")
+
+# ================== ЗАПУСК ==================
+
+def main():
+    if not BOT_TOKEN:
+        raise SystemExit("❌ Не задан TELEGRAM_BOT_TOKEN")
+    if OWNER_ID == 0:
+        raise SystemExit("❌ Не задан BOT_OWNER_ID")
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("setgroup", cmd_setgroup))
+    app.add_handler(CommandHandler("staff", cmd_staff))
+    app.add_handler(CommandHandler("addstaff", cmd_addstaff))
+    app.add_handler(CommandHandler("removestaff", cmd_removestaff))
+
+    app.add_handler(
+        MessageHandler(filters.ALL & ~filters.COMMAND, route_incoming)
+    )
+
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
