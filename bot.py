@@ -1,41 +1,17 @@
-"""Telegram bot for ГО «Ф1».
-
-Функції:
-- Сценарій звернення:
-  /start -> кнопка «Почати» -> питання про анонімність -> вибір категорії -> повідомлення
-- Приймає повідомлення від користувачів і пересилає:
-  1) у робочу групу (необовʼязково)
-  2) у приватні повідомлення співробітникам (список керується командами)
-- Категорії, опис бота, інформація про ГО, робочі години і тексти відповідей - у зовнішніх файлах.
-
-Встановлення:
-pip install -U python-telegram-bot==21.6
-
-Змінні середовища:
-TELEGRAM_BOT_TOKEN  - токен бота
-BOT_OWNER_ID        - ваш numeric Telegram ID
-ROUTING_GROUP_ID    - ID робочої групи (необовʼязково; можна задати через /setgroup)
-
-Необовʼязково:
-F1_BOT_DATA         - шлях до файлу даних (default: bot_data.json)
-F1_BOT_CONFIG       - шлях до конфігу (default: bot_config.json)
-F1_BOT_CATEGORIES   - шлях до категорій (default: categories.json)
-F1_BOT_INFO         - шлях до інформаційних текстів (default: info_texts.json)
-"""
+# bot.py
+# F1 Support Bot - routes incoming messages to configured groups and staff,
+# with category flow, anonymity option, working-hours auto replies,
+# and logging to Google Sheets.
 
 import os
 import json
-from dataclasses import dataclass, asdict
+import uuid
+from dataclasses import dataclass
+from typing import Dict, Optional, List, Any, Tuple
 from datetime import datetime, time
-from typing import Dict, Optional, List, Tuple
-
 from zoneinfo import ZoneInfo
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -46,688 +22,471 @@ from telegram.ext import (
     filters,
 )
 
-# ================== FILES / ENV ==================
+from sheets_logger import SheetsLogger
 
-DATA_FILE = os.environ.get("F1_BOT_DATA", "bot_data.json")
-CONFIG_FILE = os.environ.get("F1_BOT_CONFIG", "bot_config.json")
+# ------------------- Paths / files (static config in repo) -------------------
+
+DATA_DIR = os.environ.get("F1_DATA_DIR", ".")  # for future volumes if needed
+
 CATEGORIES_FILE = os.environ.get("F1_BOT_CATEGORIES", "categories.json")
 INFO_FILE = os.environ.get("F1_BOT_INFO", "info_texts.json")
+BOT_CONFIG_FILE = os.environ.get("F1_BOT_CONFIG", "bot_config.json")
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-OWNER_ID = int(os.environ.get("BOT_OWNER_ID", "0"))
-DEFAULT_GROUP_ID = int(os.environ.get("ROUTING_GROUP_ID", "0"))
+STAFF_FILE = os.environ.get("F1_BOT_STAFF", "staff.json")     # edited manually in GitHub
+GROUPS_FILE = os.environ.get("F1_BOT_GROUPS", "groups.json")  # edited manually in GitHub
 
-# ================== DEFAULTS ==================
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+OWNER_ID = int(os.environ.get("BOT_OWNER_ID", "0") or "0")
 
-DEFAULT_CATEGORIES = [
-    {"key": "psy", "label": "Психологічна підтримка"},
-    {"key": "law", "label": "Юридична допомога"},
-    {"key": "edu", "label": "Навчання / SkillsLab_F1"},
-    {"key": "hum", "label": "Гуманітарна допомога"},
-    {"key": "gbv", "label": "Насильство / Булінг"},
-    {"key": "other", "label": "Інше"},
-]
+KYIV_TZ = ZoneInfo(os.environ.get("F1_TZ", "Europe/Kyiv"))
 
-DEFAULT_CONFIG = {
-    "timezone": "Europe/Kyiv",
-    "working_hours": {
-        "mon": [["09:00", "18:00"]],
-        "tue": [["09:00", "18:00"]],
-        "wed": [["09:00", "18:00"]],
-        "thu": [["09:00", "18:00"]],
-        "fri": [["09:00", "18:00"]],
-        "sat": [],
-        "sun": [],
-    },
-    "messages": {
-        "welcome": "Натисніть «Почати», щоб створити звернення.",
-        "ask_anonymous": "Хочете надіслати звернення анонімно?",
-        "ask_category": "Оберіть категорію звернення:",
-        "chosen_category": "✅ Обрано: {category}\n\nТепер напишіть повідомлення - я передам його команді.",
-        "need_start": "Щоб надіслати звернення, натисніть /start і пройдіть короткі кроки.",
-        "sent_working": "✅ Дякуємо! Повідомлення передано команді. Ми відповімо протягом робочого часу.",
-        "sent_off": "✅ Дякуємо! Повідомлення передано команді. Зараз поза робочим часом - ми відповімо у найближчий робочий час.",
-        "cancelled": "Скасовано. Щоб почати знову - натисніть /start.",
-    },
-}
+# ------------------- Helpers -------------------
 
-DEFAULT_INFO = {
-    "bot_description": (
-        "🤖 Бот ГО «Ф1» - це канал звʼязку з командою.\n\n"
-        "Як це працює:\n"
-        "- натисніть «Почати»\n"
-        "- оберіть анонімність\n"
-        "- оберіть категорію\n"
-        "- надішліть повідомлення (текст, фото, файл)\n\n"
-        "Ми працюємо з повагою, конфіденційністю та без осуду."
-    ),
-    "ngo_info": (
-        "ℹ️ ГО «Ф1» - всеукраїнське громадське обʼєднання.\n"
-        "Напрями: протидія насильству, психосоціальна підтримка, навчання та перекваліфікація, гуманітарна допомога, розвиток громад."
-    ),
-}
-
-# ================== DATA ==================
-
-@dataclass
-class StaffMember:
-    user_id: int
-    username: Optional[str] = None
-    name: Optional[str] = None
-
-
-def _safe_read_json(path: str, default):
+def _load_json(path: str, default: Any) -> Any:
+    # allow mounting under DATA_DIR if user passes relative paths
+    p = path
+    if not os.path.isabs(p):
+        p = os.path.join(DATA_DIR, p)
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(p, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return default
 
+def _now_local() -> datetime:
+    return datetime.now(tz=KYIV_TZ)
 
-def load_config() -> dict:
-    cfg = _safe_read_json(CONFIG_FILE, DEFAULT_CONFIG)
-    if not isinstance(cfg, dict):
-        cfg = dict(DEFAULT_CONFIG)
-    cfg.setdefault("timezone", DEFAULT_CONFIG["timezone"])
-    cfg.setdefault("working_hours", DEFAULT_CONFIG["working_hours"])
-    cfg.setdefault("messages", DEFAULT_CONFIG["messages"])
-    for k, v in DEFAULT_CONFIG["messages"].items():
-        cfg["messages"].setdefault(k, v)
-    return cfg
+def _fmt_dt(dt: datetime) -> str:
+    return dt.strftime("%d.%m.%Y %H:%M")
 
+def _dow_key(dt: datetime) -> str:
+    # mon..sun
+    return ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][dt.weekday()]
 
-CFG = load_config()
-TZ = ZoneInfo(CFG.get("timezone", "Europe/Kyiv"))
+def _parse_hhmm(s: str) -> time:
+    hh, mm = s.strip().split(":")
+    return time(int(hh), int(mm))
 
-
-def load_categories() -> List[Tuple[str, str]]:
-    items = _safe_read_json(CATEGORIES_FILE, DEFAULT_CATEGORIES)
-    out: List[Tuple[str, str]] = []
-    if isinstance(items, list):
-        for it in items:
-            if isinstance(it, dict) and it.get("key") and it.get("label"):
-                out.append((str(it["key"]), str(it["label"])))
-    return out or [(c["key"], c["label"]) for c in DEFAULT_CATEGORIES]
-
-
-CATEGORIES = load_categories()
-
-
-def load_info() -> dict:
-    info = _safe_read_json(INFO_FILE, DEFAULT_INFO)
-    if not isinstance(info, dict):
-        info = dict(DEFAULT_INFO)
-    for k, v in DEFAULT_INFO.items():
-        info.setdefault(k, v)
-    return info
-
-
-INFO = load_info()
-
-
-def load_data() -> dict:
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            data = {}
-    else:
-        data = {}
-
-    data.setdefault("group_id", DEFAULT_GROUP_ID)
-    data.setdefault("staff", {})
-    data.setdefault("tickets", {})  # id -> ticket dict
-    return data
-
-
-def save_data(data: dict) -> None:
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def is_owner(update: Update) -> bool:
-    return bool(update.effective_user and update.effective_user.id == OWNER_ID)
-
-
-def parse_int(s: str):
-    try:
-        return int(s)
-    except Exception:
-        return None
-
-
-def is_working_time(now_utc: datetime) -> bool:
-    now = now_utc.astimezone(TZ)
-    dow = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][now.weekday()]
-    intervals = (CFG.get("working_hours") or {}).get(dow, [])
-    if not intervals:
+def is_working_time(cfg: dict, dt: datetime) -> bool:
+    wh = (cfg or {}).get("working_hours", {}) or {}
+    day = _dow_key(dt)
+    ranges = wh.get(day, []) or []
+    if not ranges:
         return False
-
-    for start_s, end_s in intervals:
-        try:
-            sh, sm = map(int, start_s.split(":"))
-            eh, em = map(int, end_s.split(":"))
-            start_t = time(sh, sm)
-            end_t = time(eh, em)
-        except Exception:
+    t = dt.timetz().replace(tzinfo=None)  # compare naive times
+    for r in ranges:
+        if not isinstance(r, list) or len(r) != 2:
             continue
-
-        if start_t <= now.time() <= end_t:
+        start = _parse_hhmm(r[0])
+        end = _parse_hhmm(r[1])
+        if start <= t <= end:
             return True
     return False
 
+def is_owner(update: Update) -> bool:
+    return update.effective_user is not None and update.effective_user.id == OWNER_ID
 
-def short_ticket_id() -> str:
-    # 6 символів base36-ish
-    import random, string
-    alphabet = string.digits + string.ascii_lowercase
-    return "".join(random.choice(alphabet) for _ in range(6))
+@dataclass
+class StaffMember:
+    user_id: int
+    name: str = ""
+    username: str = ""
+    active: bool = True
 
-
-def allowed_staff_ids() -> set[int]:
-    data = load_data()
-    ids = {OWNER_ID}
-    for v in (data.get("staff") or {}).values():
+def load_staff() -> Dict[str, StaffMember]:
+    raw = _load_json(STAFF_FILE, {}) or {}
+    out: Dict[str, StaffMember] = {}
+    for k, v in raw.items():
         try:
-            ids.add(int(v.get("user_id")))
+            uid = int(k)
         except Exception:
-            pass
-    return ids
+            continue
+        if isinstance(v, dict):
+            out[str(uid)] = StaffMember(
+                user_id=uid,
+                name=str(v.get("name", "") or ""),
+                username=str(v.get("username", "") or "").lstrip("@"),
+                active=bool(v.get("active", True)),
+            )
+    return out
 
+def load_groups() -> Dict[str, dict]:
+    # groups.json format:
+    # {
+    #   "-100123...": {"name":"...", "active": true},
+    #   "-100456...": {"name":"...", "active": false}
+    # }
+    raw = _load_json(GROUPS_FILE, {}) or {}
+    out: Dict[str, dict] = {}
+    for k, v in raw.items():
+        try:
+            gid = int(k)
+        except Exception:
+            continue
+        if isinstance(v, dict):
+            out[str(gid)] = {
+                "id": gid,
+                "name": str(v.get("name", "") or ""),
+                "active": bool(v.get("active", True)),
+            }
+    return out
 
-# ================== KEYBOARDS ==================
+def load_categories() -> List[dict]:
+    # expected list: [{"key":"psy","label":"..."}]
+    raw = _load_json(CATEGORIES_FILE, []) or []
+    cats = []
+    for it in raw:
+        if isinstance(it, dict) and it.get("key") and it.get("label"):
+            cats.append({"key": str(it["key"]), "label": str(it["label"])})
+    return cats
 
-def kb_start() -> InlineKeyboardMarkup:
+def load_info() -> dict:
+    # keys: bot_description, ngo_mission, ngo_directions, ngo_contacts
+    return _load_json(INFO_FILE, {}) or {}
+
+def load_bot_config() -> dict:
+    return _load_json(BOT_CONFIG_FILE, {}) or {}
+
+def build_categories_keyboard(categories: List[dict]) -> InlineKeyboardMarkup:
+    kb: List[List[InlineKeyboardButton]] = []
+    for c in categories:
+        kb.append([InlineKeyboardButton(c["label"], callback_data=f"cat:{c['key']}")])
+    kb.append([InlineKeyboardButton("ℹ️ Інформація про бота", callback_data="info:bot")])
+    kb.append([InlineKeyboardButton("ℹ️ Інформація про ГО «Ф1»", callback_data="info:ngo")])
+    kb.append([InlineKeyboardButton("🔁 Змінити анонімність", callback_data="flow:anon")])
+    kb.append([InlineKeyboardButton("❌ Скасувати", callback_data="flow:cancel")])
+    return InlineKeyboardMarkup(kb)
+
+def build_start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("Почати", callback_data="flow:start")]])
 
+def build_anon_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Так, анонімно", callback_data="anon:yes")],
+        [InlineKeyboardButton("Ні, не анонімно", callback_data="anon:no")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back:start")],
+    ])
 
-def kb_cancel() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Скасувати", callback_data="flow:cancel")]])
+def build_ngo_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Місія", callback_data="ngo:mission")],
+        [InlineKeyboardButton("Напрями діяльності", callback_data="ngo:directions")],
+        [InlineKeyboardButton("Контакти", callback_data="ngo:contacts")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back:cats")],
+    ])
 
+def build_back_to_ngo_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back:ngo")]])
 
-def kb_anonymous() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+def build_status_keyboard(case_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
         [
-            [
-                InlineKeyboardButton("Так", callback_data="anon:yes"),
-                InlineKeyboardButton("Ні", callback_data="anon:no"),
-            ],
-            [InlineKeyboardButton("❌ Скасувати", callback_data="flow:cancel")],
+            InlineKeyboardButton("✅ Взято", callback_data=f"st:{case_id}:taken"),
+            InlineKeyboardButton("⏳ Очікуємо", callback_data=f"st:{case_id}:wait"),
+            InlineKeyboardButton("🏁 Закрито", callback_data=f"st:{case_id}:done"),
         ]
+    ])
+
+# ------------------- Global loaded config (static) -------------------
+
+CATEGORIES = load_categories()
+INFO_TEXTS = load_info()
+BOT_CFG = load_bot_config()
+STAFF = load_staff()
+GROUPS = load_groups()
+
+SHEETS = SheetsLogger(
+    spreadsheet_id=os.environ.get("F1_SHEETS_ID", "").strip(),
+    tab_name=os.environ.get("F1_SHEETS_TAB", "log").strip(),
+    sa_json=os.environ.get("F1_GOOGLE_SA_JSON", "").strip(),
+    sa_file=os.environ.get("F1_GOOGLE_SA_FILE", "").strip(),
+)
+
+# ------------------- UI render helpers -------------------
+
+async def show_start(update_or_q, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
+    text = INFO_TEXTS.get("bot_description", "Вітаю! Це бот ГО «Ф1».")
+    if edit:
+        await update_or_q.edit_message_text(text, reply_markup=build_start_keyboard())
+    else:
+        await update_or_q.message.reply_text(text, reply_markup=build_start_keyboard())
+
+async def show_categories(q, context: ContextTypes.DEFAULT_TYPE):
+    await q.edit_message_text(
+        "Оберіть тему звернення:",
+        reply_markup=build_categories_keyboard(CATEGORIES),
     )
 
-
-def kb_categories() -> InlineKeyboardMarkup:
-    buttons = [[InlineKeyboardButton(label, callback_data=f"cat:{key}")] for key, label in CATEGORIES]
-    buttons.append([InlineKeyboardButton("ℹ️ Інформація про бота", callback_data="info:bot")])
-    buttons.append([InlineKeyboardButton("ℹ️ Інформація про ГО «Ф1»", callback_data="info:ngo")])
-    buttons.append([InlineKeyboardButton("🔁 Змінити анонімність", callback_data="flow:change_anon")])
-    buttons.append([InlineKeyboardButton("❌ Скасувати", callback_data="flow:cancel")])
-    return InlineKeyboardMarkup(buttons)
-
-
-def kb_back_to_categories() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back:categories")]])
-
-
-
-
-def kb_ngo_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Місія", callback_data="info:ngo:mission")],
-            [InlineKeyboardButton("Напрями діяльності", callback_data="info:ngo:directions")],
-            [InlineKeyboardButton("Контакти", callback_data="info:ngo:contacts")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back:categories")],
-        ]
+async def show_ngo_menu(q, context: ContextTypes.DEFAULT_TYPE):
+    await q.edit_message_text(
+        "Інформація про ГО «Ф1»:",
+        reply_markup=build_ngo_menu_keyboard(),
     )
 
-
-def kb_back_to_ngo_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back:categories")]])
-
-def kb_ticket_actions(ticket_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✅ Взято", callback_data=f"t:take:{ticket_id}"),
-                InlineKeyboardButton("⏳ Очікуємо", callback_data=f"t:wait:{ticket_id}"),
-                InlineKeyboardButton("🏁 Закрито", callback_data=f"t:done:{ticket_id}"),
-            ]
-        ]
-    )
-
-
-# ================== FLOW ==================
+# ------------------- Commands (no staff/group editing; only viewing) -------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # скидаємо вибір
-    context.user_data.clear()
-    context.user_data["flow_step"] = "start"
-
-    # 1) опис бота
-    desc = (INFO.get("bot_description") or "").strip()
-    if desc:
-        await update.message.reply_text(desc)
-
-    # 2) кнопка «Почати»
-    await update.message.reply_text(CFG["messages"]["welcome"], reply_markup=kb_start())
-
+    # reset flow state
+    context.user_data.setdefault("flow", {})
+    await show_start(update, context, edit=False)
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    txt = (
         "Команди:\n"
         "/start - почати\n"
-        "/category - змінити категорію\n"
-        "/worktime - показати робочий статус\n"
-        "/staff - список співробітників\n"
-        "/addstaff <user_id> [@username] [Ім'я]\n"
-        "/removestaff <user_id>\n"
-        "/setgroup <group_id>\n"
-        "/report [days] - звіт (лише власник)"
+        "/help - довідка\n"
+        "/staff - список співробітників (тільки власник)\n"
+        "/groups - список груп (тільки власник)\n"
+        "/worktime - показати робочий час\n\n"
+        "Надішліть повідомлення - бот передасть його команді."
     )
+    await update.message.reply_text(txt)
 
+async def cmd_staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return await update.message.reply_text("Нема доступу.")
+    items = [m for m in STAFF.values() if m.active]
+    if not items:
+        return await update.message.reply_text("Список співробітників порожній.")
+    lines = []
+    for m in sorted(items, key=lambda x: x.user_id):
+        extra = []
+        if m.username:
+            extra.append(f"@{m.username}")
+        if m.name:
+            extra.append(m.name)
+        lines.append(f"- `{m.user_id}` {' '.join(extra)}".strip())
+    await update.message.reply_text("Співробітники:\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return await update.message.reply_text("Нема доступу.")
+    items = [g for g in GROUPS.values() if g.get("active")]
+    if not items:
+        return await update.message.reply_text("Список груп порожній.")
+    lines = []
+    for g in sorted(items, key=lambda x: int(x["id"])):
+        name = g.get("name") or ""
+        lines.append(f"- `{g['id']}` {name}".strip())
+    await update.message.reply_text("Групи:\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_worktime(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    now = datetime.now(tz=ZoneInfo("UTC"))
-    if is_working_time(now):
-        await update.message.reply_text("🟢 Зараз робочий час.")
-    else:
-        await update.message.reply_text("🔴 Зараз поза робочим часом.")
+    wh = (BOT_CFG.get("working_hours") or {})
+    await update.message.reply_text("Робочий час (Europe/Kyiv):\n" + json.dumps(wh, ensure_ascii=False, indent=2))
 
+# ------------------- Callback flow -------------------
 
-async def cmd_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # дозволяє змінити категорію в будь-який момент
-    context.user_data["flow_step"] = "category"
-    await update.message.reply_text(CFG["messages"]["ask_category"], reply_markup=kb_categories())
-
-
-async def on_flow_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q:
-        return
     await q.answer()
-    context.user_data["flow_step"] = "anon"
-    await q.edit_message_text(CFG["messages"]["ask_anonymous"], reply_markup=kb_anonymous())
+    data = q.data or ""
 
+    if data == "flow:start":
+        context.user_data["anonymous"] = None
+        context.user_data["category_key"] = None
+        context.user_data["category_label"] = None
+        await q.edit_message_text("Бажаєте надіслати звернення анонімно?", reply_markup=build_anon_keyboard())
+        return
 
-async def on_flow_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if q:
-        await q.answer()
+    if data == "flow:anon":
+        await q.edit_message_text("Бажаєте надіслати звернення анонімно?", reply_markup=build_anon_keyboard())
+        return
+
+    if data == "flow:cancel":
         context.user_data.clear()
-        try:
-            await q.edit_message_text(CFG["messages"]["cancelled"])
-        except Exception:
-            pass
+        await show_start(q, context, edit=True)
         return
 
-    # якщо як команда
-    context.user_data.clear()
-    if update.message:
-        await update.message.reply_text(CFG["messages"]["cancelled"])
-
-
-async def on_change_anon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q:
-        return
     await q.answer()
-    context.user_data["flow_step"] = "anon"
-    await q.edit_message_text(CFG["messages"]["ask_anonymous"], reply_markup=kb_anonymous())
+    data = q.data or ""
+    if data == "back:start":
+        await show_start(q, context, edit=True)
+        return
+    if data == "back:cats":
+        await show_categories(q, context)
+        return
+    if data == "back:ngo":
+        await show_ngo_menu(q, context)
+        return
 
-
-async def on_anonymous_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q:
-        return
     await q.answer()
-
     if q.data == "anon:yes":
         context.user_data["anonymous"] = True
     else:
         context.user_data["anonymous"] = False
-
-    context.user_data["flow_step"] = "category"
-    await q.edit_message_text(CFG["messages"]["ask_category"], reply_markup=kb_categories())
-
+    await show_categories(q, context)
 
 async def on_category_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q:
-        return
     await q.answer()
-
-    data = q.data or ""
-    if not data.startswith("cat:"):
-        return
-    key = data.split("cat:", 1)[1].strip()
-    label = next((lbl for k, lbl in CATEGORIES if k == key), None)
-    if not label:
-        return await q.edit_message_text("Категорія не знайдена. Спробуйте /start ще раз.")
-
+    key = (q.data or "").split(":", 1)[1] if ":" in (q.data or "") else ""
+    label = None
+    for c in CATEGORIES:
+        if c["key"] == key:
+            label = c["label"]
+            break
     context.user_data["category_key"] = key
-    context.user_data["category_label"] = label
-    context.user_data["flow_step"] = "ready"
-
+    context.user_data["category_label"] = label or key
     await q.edit_message_text(
-        CFG["messages"]["chosen_category"].format(category=label),
+        f"Обрано категорію: *{context.user_data['category_label']}*\n\nТепер напишіть повідомлення (можна текст, фото або файл).",
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back:cats")]]),
     )
-
 
 async def on_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q:
-        return
     await q.answer()
-
-    if q.data == "info:bot":
-        txt = (INFO.get("bot_description", "") or "").strip() or "Немає інформації."
-        await q.edit_message_text(f"ℹ️ Інформація про бота\n\n{txt}", reply_markup=kb_back_to_categories())
+    data = q.data or ""
+    if data == "info:bot":
+        txt = INFO_TEXTS.get("bot_description", "Це бот ГО «Ф1».")
+        await q.edit_message_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back:cats")]]))
+        return
+    if data == "info:ngo":
+        await show_ngo_menu(q, context)
         return
 
-    if q.data == "info:ngo":
-        await q.edit_message_text("ℹ️ Інформація про ГО «Ф1»\n\nОберіть розділ:", reply_markup=kb_ngo_menu())
-        return
-
-    if q.data == "info:ngo:mission":
-        txt = (INFO.get("ngo_mission", "") or "").strip() or "Немає інформації."
-        await q.edit_message_text(f"Місія\n\n{txt}", reply_markup=kb_back_to_ngo_menu())
-        return
-
-    if q.data == "info:ngo:directions":
-        txt = (INFO.get("ngo_directions", "") or "").strip() or "Немає інформації."
-        await q.edit_message_text(f"Напрями діяльності\n\n{txt}", reply_markup=kb_back_to_ngo_menu())
-        return
-
-    if q.data == "info:ngo:contacts":
-        txt = (INFO.get("ngo_contacts", "") or "").strip() or "Немає інформації."
-        await q.edit_message_text(f"Контакти\n\n{txt}", reply_markup=kb_back_to_ngo_menu())
-        return
-
-
-async def on_back_to_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_ngo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q:
-        return
     await q.answer()
-    context.user_data["flow_step"] = "category"
-    await q.edit_message_text(CFG["messages"]["ask_category"], reply_markup=kb_categories())
+    data = q.data or ""
+    if data == "ngo:mission":
+        txt = INFO_TEXTS.get("ngo_mission", "Місія: ...")
+        await q.edit_message_text(txt, reply_markup=build_back_to_ngo_keyboard())
+        return
+    if data == "ngo:directions":
+        txt = INFO_TEXTS.get("ngo_directions", "Напрями діяльності: ...")
+        await q.edit_message_text(txt, reply_markup=build_back_to_ngo_keyboard())
+        return
+    if data == "ngo:contacts":
+        txt = INFO_TEXTS.get("ngo_contacts", "Контакти: ...")
+        await q.edit_message_text(txt, reply_markup=build_back_to_ngo_keyboard())
+        return
 
+# ------------------- Status buttons in group -------------------
 
-
-async def on_back_to_ngo_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q:
-        return
     await q.answer()
-    await q.edit_message_text("ℹ️ Інформація про ГО «Ф1»\n\nОберіть розділ:", reply_markup=kb_ngo_menu())
+    data = q.data or ""
+    # st:<case_id>:<status>
+    parts = data.split(":")
+    if len(parts) != 3:
+        return
+    case_id, st = parts[1], parts[2]
+    actor = q.from_user.full_name if q.from_user else ""
+    now = _now_local()
+    # log status to sheets
+    SHEETS.log_event({
+        "event": "status",
+        "timestamp": _fmt_dt(now),
+        "case_id": case_id,
+        "status": st,
+        "actor": actor,
+    })
+    try:
+        await q.message.reply_text(f"Статус звернення *{case_id}*: *{st}* (від {actor})", parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        pass
 
+# ------------------- Main routing -------------------
 
-# ================== ADMIN: GROUP / STAFF ==================
+def _active_group_ids() -> List[int]:
+    ids = []
+    for g in GROUPS.values():
+        if g.get("active"):
+            try:
+                ids.append(int(g["id"]))
+            except Exception:
+                pass
+    return ids
 
-async def cmd_setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return await update.message.reply_text("Нема доступу.")
-    if not context.args:
-        return await update.message.reply_text("Використання: /setgroup <group_id>")
+def _active_staff() -> List[StaffMember]:
+    return [m for m in STAFF.values() if m.active]
 
-    gid = parse_int(context.args[0])
-    if gid is None:
-        return await update.message.reply_text("group_id має бути числом (наприклад: -1001234567890).")
-
-    data = load_data()
-    data["group_id"] = gid
-    save_data(data)
-    await update.message.reply_text(f"✅ Групу встановлено: `{gid}`", parse_mode=ParseMode.MARKDOWN)
-
-
-async def cmd_staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    staff: Dict[str, dict] = data.get("staff", {})
-    if not staff:
-        return await update.message.reply_text("Список співробітників порожній.")
-    members = [StaffMember(**v) for v in staff.values()]
-
-    def line(m: StaffMember) -> str:
-        u = f"@{m.username}" if m.username else ""
-        n = f"{m.name}" if m.name else ""
-        extra = " ".join(x for x in [u, n] if x).strip()
-        return f"- `{m.user_id}` {extra}".strip()
-
-    lines = "\n".join(line(m) for m in sorted(members, key=lambda x: x.user_id))
-    await update.message.reply_text("Співробітники:\n" + lines, parse_mode=ParseMode.MARKDOWN)
-
-
-async def cmd_addstaff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return await update.message.reply_text("Нема доступу.")
-    if not context.args:
-        return await update.message.reply_text("Використання: /addstaff <user_id> [@username] [Ім'я]")
-
-    uid = parse_int(context.args[0])
-    if uid is None:
-        return await update.message.reply_text("user_id має бути числом.")
-
-    username = context.args[1].lstrip("@") if len(context.args) >= 2 else None
-    name = " ".join(context.args[2:]).strip() if len(context.args) >= 3 else None
-
-    data = load_data()
-    staff = data.setdefault("staff", {})
-    staff[str(uid)] = asdict(StaffMember(user_id=uid, username=username, name=name))
-    save_data(data)
-
-    await update.message.reply_text(f"✅ Додано співробітника: `{uid}`", parse_mode=ParseMode.MARKDOWN)
-
-
-async def cmd_removestaff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return await update.message.reply_text("Нема доступу.")
-    if not context.args:
-        return await update.message.reply_text("Використання: /removestaff <user_id>")
-
-    uid = parse_int(context.args[0])
-    if uid is None:
-        return await update.message.reply_text("user_id має бути числом.")
-
-    data = load_data()
-    staff = data.get("staff", {})
-    if str(uid) in staff:
-        del staff[str(uid)]
-        save_data(data)
-        await update.message.reply_text(f"✅ Видалено: `{uid}`", parse_mode=ParseMode.MARKDOWN)
+def _build_header(user, anonymous: bool, category_label: str, case_id: str, dt: datetime) -> str:
+    lines = ["🟦 Нове звернення", f"Категорія: {category_label}", f"ID: {case_id}", f"Час: {_fmt_dt(dt)}"]
+    if anonymous:
+        lines.append("🔒 Анонімне звернення")
     else:
-        await update.message.reply_text("Такого співробітника немає у списку.")
-
-
-# ================== TICKETS / MEAL ==================
-
-def _now_iso() -> str:
-    return datetime.now(tz=ZoneInfo("UTC")).isoformat()
-
-
-def create_ticket(data: dict, *, user_id: int, anonymous: bool, category: str) -> str:
-    tickets = data.setdefault("tickets", {})
-    tid = short_ticket_id()
-    # ensure unique
-    while tid in tickets:
-        tid = short_ticket_id()
-
-    tickets[tid] = {
-        "id": tid,
-        "created_at": _now_iso(),
-        "user_id": user_id,
-        "anonymous": bool(anonymous),
-        "category": category,
-        "status": "new",
-        "assignee": None,
-        "last_update": _now_iso(),
-    }
-    return tid
-
-
-def set_ticket_status(data: dict, tid: str, status: str, assignee: Optional[str]) -> bool:
-    t = (data.get("tickets") or {}).get(tid)
-    if not t:
-        return False
-    t["status"] = status
-    t["assignee"] = assignee
-    t["last_update"] = _now_iso()
-    return True
-
-
-async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return await update.message.reply_text("Нема доступу.")
-    days = 7
-    if context.args:
-        try:
-            days = max(1, min(90, int(context.args[0])))
-        except Exception:
-            days = 7
-
-    data = load_data()
-    tickets = list((data.get("tickets") or {}).values())
-    if not tickets:
-        return await update.message.reply_text("Немає звернень у журналі.")
-
-    cutoff = datetime.now(tz=ZoneInfo("UTC")).timestamp() - days * 86400
-
-    def parse_ts(s: str) -> float:
-        try:
-            return datetime.fromisoformat(s).timestamp()
-        except Exception:
-            return 0.0
-
-    tickets = [t for t in tickets if parse_ts(t.get("created_at", "")) >= cutoff]
-    if not tickets:
-        return await update.message.reply_text(f"Немає звернень за останні {days} днів.")
-
-    by_cat: Dict[str, int] = {}
-    by_status: Dict[str, int] = {}
-    anon_count = 0
-
-    for t in tickets:
-        by_cat[t.get("category") or ""] = by_cat.get(t.get("category") or "", 0) + 1
-        by_status[t.get("status") or ""] = by_status.get(t.get("status") or "", 0) + 1
-        if t.get("anonymous"):
-            anon_count += 1
-
-    lines = [f"📊 Звіт за {days} днів", f"Всього звернень: {len(tickets)}", f"Анонімних: {anon_count}"]
-    lines.append("\nЗа категоріями:")
-    for k, v in sorted(by_cat.items(), key=lambda x: (-x[1], x[0])):
-        lines.append(f"- {k}: {v}")
-
-    lines.append("\nЗа статусами:")
-    for k, v in sorted(by_status.items(), key=lambda x: (-x[1], x[0])):
-        lines.append(f"- {k}: {v}")
-
-    await update.message.reply_text("\n".join(lines))
-
-
-# ================== ROUTING ==================
+        from_line = f"Від: {user.full_name} (id {user.id})"
+        if user.username:
+            from_line += f" @{user.username}"
+        lines.append(from_line)
+    return "\n".join(lines)
 
 async def route_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    if not msg:
+    if not msg or not update.effective_user:
         return
 
-    cat_label = context.user_data.get("category_label")
-    if not cat_label:
-        return await msg.reply_text(CFG["messages"]["need_start"])
-
-    data = load_data()
-    group_id = int(data.get("group_id") or 0)
-    staff_dict: Dict[str, dict] = data.get("staff", {})
-
     user = update.effective_user
+    dt = _now_local()
+
     anonymous = bool(context.user_data.get("anonymous"))
+    category_key = context.user_data.get("category_key") or ""
+    category_label = context.user_data.get("category_label") or (category_key or "Без категорії")
 
-    # створюємо ticket
-    tid = create_ticket(data, user_id=user.id if user else 0, anonymous=anonymous, category=cat_label)
-    save_data(data)
+    # if user hasn't selected category yet, gently prompt
+    if not category_label or category_label == "Без категорії":
+        await msg.reply_text("Будь ласка, натисніть /start і оберіть категорію звернення.")
+        return
 
-    # header
-    if anonymous:
-        from_line = "Від: Анонімно"
-        privacy_line = "🔒 Анонімне звернення"
-    else:
-        from_line = f"Від: {user.full_name}"
-        if user.username:
-            from_line += f" @{user.username}"
-        # id залишаємо тільки для неанонімних
-        from_line += f" (id {user.id})"
-        privacy_line = ""
+    case_id = uuid.uuid4().hex[:8]
 
-    header_lines = [f"🟦 Нове звернення [{cat_label}] #{tid}", from_line]
-    if privacy_line:
-        header_lines.append(privacy_line)
-    header = "\n".join(header_lines)
+    # ---------- LOG TO SHEETS (immediately) ----------
+    # store minimal text safely (no PII when anonymous)
+    text_preview = ""
+    if msg.text:
+        text_preview = msg.text[:2000]
+    event = {
+        "event": "incoming",
+        "timestamp": _fmt_dt(dt),
+        "case_id": case_id,
+        "anonymous": "yes" if anonymous else "no",
+        "category_key": category_key,
+        "category_label": category_label,
+        "message_type": "text" if msg.text else ("caption" if msg.caption else "media"),
+        "text": ("" if anonymous else text_preview),
+        "user_id": ("" if anonymous else str(user.id)),
+        "username": ("" if anonymous else (user.username or "")),
+        "full_name": ("" if anonymous else user.full_name),
+    }
+    SHEETS.log_event(event)
 
-    # у групу
-    if group_id != 0:
+    # ---------- ROUTE ----------
+    header = _build_header(user, anonymous, category_label, case_id, dt)
+
+    # to groups
+    group_ids = _active_group_ids()
+    for gid in group_ids:
         try:
-            await context.bot.send_message(chat_id=group_id, text=header, reply_markup=kb_ticket_actions(tid))
-            await msg.copy(chat_id=group_id)
+            await context.bot.send_message(chat_id=gid, text=header, reply_markup=build_status_keyboard(case_id))
+            await msg.copy(chat_id=gid)
         except Exception:
+            # ignore; no spam to user
             pass
 
-    # співробітникам
-    for v in staff_dict.values():
-        m = StaffMember(**v)
+    # to staff DMs
+    for m in _active_staff():
         try:
             await context.bot.send_message(chat_id=m.user_id, text=header)
             await msg.copy(chat_id=m.user_id)
         except Exception:
             pass
 
-    # відповідь користувачу залежно від робочого часу
-    if is_working_time(datetime.now(tz=ZoneInfo("UTC"))):
-        await msg.reply_text(CFG["messages"]["sent_working"])
+    # ---------- AUTO-REPLY to user by working time ----------
+    msgs = BOT_CFG.get("messages", {}) or {}
+    if is_working_time(BOT_CFG, dt):
+        reply = msgs.get("in_hours", "Дякуємо! Повідомлення передано команді.")
     else:
-        await msg.reply_text(CFG["messages"]["sent_off"])
+        reply = msgs.get("out_of_hours", "Дякуємо! Ми отримали звернення поза робочим часом і відповімо в найближчий робочий день.")
+    await msg.reply_text(reply)
 
-
-async def on_ticket_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q:
-        return
-    await q.answer()
-
-    # права: власник або співробітник зі списку
-    uid = q.from_user.id if q.from_user else 0
-    if uid not in allowed_staff_ids():
-        return await q.answer("Нема доступу.", show_alert=True)
-
-    parts = (q.data or "").split(":")
-    if len(parts) != 3:
-        return
-    _, action, tid = parts
-
-    status_map = {"take": "in_progress", "wait": "waiting", "done": "done"}
-    status = status_map.get(action)
-    if not status:
-        return
-
-    assignee = q.from_user.full_name if q.from_user else None
-
-    data = load_data()
-    ok = set_ticket_status(data, tid, status, assignee)
-    if not ok:
-        return await q.answer("Звернення не знайдено.", show_alert=True)
-    save_data(data)
-
-    # повідомлення у групі як підтвердження (не чіпаємо оригінальний header, щоб не зламати контент)
-    try:
-        status_ua = {"in_progress": "Взято в роботу", "waiting": "Очікуємо", "done": "Закрито"}[status]
-        await q.message.reply_text(f"📌 Статус #{tid}: {status_ua}. Відповідальна особа: {assignee}")
-    except Exception:
-        pass
-
-
-# ================== MAIN ==================
+# ------------------- Bootstrap -------------------
 
 def main():
     if not BOT_TOKEN:
@@ -737,35 +496,26 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # flow
+    # commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("category", cmd_category))
+    app.add_handler(CommandHandler("staff", cmd_staff))
+    app.add_handler(CommandHandler("groups", cmd_groups))
     app.add_handler(CommandHandler("worktime", cmd_worktime))
 
-    app.add_handler(CallbackQueryHandler(on_flow_start, pattern=r"^flow:start$"))
-    app.add_handler(CallbackQueryHandler(on_flow_cancel, pattern=r"^flow:cancel$"))
-    app.add_handler(CallbackQueryHandler(on_change_anon, pattern=r"^flow:change_anon$"))
-    app.add_handler(CallbackQueryHandler(on_anonymous_pick, pattern=r"^anon:(yes|no)$"))
+    # callbacks (order matters)
+    app.add_handler(CallbackQueryHandler(on_back, pattern=r"^back:(start|cats|ngo)$"))
+    app.add_handler(CallbackQueryHandler(on_flow, pattern=r"^flow:(start|anon|cancel)$"))
+    app.add_handler(CallbackQueryHandler(on_anonymous, pattern=r"^anon:(yes|no)$"))
     app.add_handler(CallbackQueryHandler(on_category_pick, pattern=r"^cat:"))
     app.add_handler(CallbackQueryHandler(on_info, pattern=r"^info:"))
-    app.add_handler(CallbackQueryHandler(on_back_to_categories, pattern=r"^back:categories$"))
-
-    # tickets
-    app.add_handler(CallbackQueryHandler(on_ticket_action, pattern=r"^t:(take|wait|done):"))
-
-    # admin
-    app.add_handler(CommandHandler("setgroup", cmd_setgroup))
-    app.add_handler(CommandHandler("staff", cmd_staff))
-    app.add_handler(CommandHandler("addstaff", cmd_addstaff))
-    app.add_handler(CommandHandler("removestaff", cmd_removestaff))
-    app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CallbackQueryHandler(on_ngo, pattern=r"^ngo:"))
+    app.add_handler(CallbackQueryHandler(on_status, pattern=r"^st:"))
 
     # messages
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, route_incoming))
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
