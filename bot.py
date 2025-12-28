@@ -1,521 +1,579 @@
-# bot.py
-# F1 Support Bot - routes incoming messages to configured groups and staff,
-# with category flow, anonymity option, working-hours auto replies,
-# and logging to Google Sheets.
+"""Telegram bot for ГО «Ф1».
 
-import os
+Key features:
+- Friendly UX: Main menu with buttons, works on re-open (no need to искать /start)
+- Flow: /start -> Menu -> Почати -> Анонімно? -> Категорія -> Повідомлення
+- Extra screens: Про бота, Про ГО «Ф1» (Місія / Напрями діяльності / Контакти)
+- Routing: forwards user messages to active groups and active staff (from JSON files)
+- Logging: appends each request to Google Sheets (optional; via sheets_logger.py)
+- Config: categories/messages/working hours/texts are stored in external JSON files
+
+Env vars:
+- TELEGRAM_BOT_TOKEN (required)
+- BOT_OWNER_ID (optional, for /staff /groups debug)
+- F1_BOT_DATA (optional, path to runtime data file for small state; default bot_data.json)
+- F1_SHEETS_ID, F1_SHEETS_TAB, F1_GOOGLE_SA_JSON (optional, for Google Sheets logger)
+
+Files (in repo root):
+- categories.json
+- bot_config.json
+- info_texts.json
+- staff.json
+- groups.json
+- sheets_logger.py
+"""
+
+from __future__ import annotations
+
 import json
-import uuid
+import os
+import logging
 from dataclasses import dataclass
-from typing import Dict, Optional, List, Any, Tuple
 from datetime import datetime, time
-from zoneinfo import ZoneInfo
+from typing import Any, Dict, List, Optional, Tuple
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
 
-from sheets_logger import SheetsLogger
+# -------------------- Logging --------------------
 
-# ------------------- Paths / files (static config in repo) -------------------
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("f1-bot")
 
-DATA_DIR = os.environ.get("F1_DATA_DIR", ".")  # for future volumes if needed
 
-CATEGORIES_FILE = os.environ.get("F1_BOT_CATEGORIES", "categories.json")
-INFO_FILE = os.environ.get("F1_BOT_INFO", "info_texts.json")
-BOT_CONFIG_FILE = os.environ.get("F1_BOT_CONFIG", "bot_config.json")
+# -------------------- Paths / Env --------------------
 
-STAFF_FILE = os.environ.get("F1_BOT_STAFF", "staff.json")     # edited manually in GitHub
-GROUPS_FILE = os.environ.get("F1_BOT_GROUPS", "groups.json")  # edited manually in GitHub
-
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 OWNER_ID = int(os.environ.get("BOT_OWNER_ID", "0") or "0")
 
-KYIV_TZ = ZoneInfo(os.environ.get("F1_TZ", "Europe/Kyiv"))
+DATA_FILE = os.environ.get("F1_BOT_DATA", "bot_data.json")
 
-# ------------------- Helpers -------------------
+CATEGORIES_FILE = os.environ.get("F1_CATEGORIES_FILE", "categories.json")
+CONFIG_FILE = os.environ.get("F1_CONFIG_FILE", "bot_config.json")
+INFO_TEXTS_FILE = os.environ.get("F1_INFO_TEXTS_FILE", "info_texts.json")
+STAFF_FILE = os.environ.get("F1_STAFF_FILE", "staff.json")
+GROUPS_FILE = os.environ.get("F1_GROUPS_FILE", "groups.json")
 
-def _load_json(path: str, default: Any) -> Any:
-    # allow mounting under DATA_DIR if user passes relative paths
-    p = path
-    if not os.path.isabs(p):
-        p = os.path.join(DATA_DIR, p)
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
 
-def _now_local() -> datetime:
-    return datetime.now(tz=KYIV_TZ)
-
-def _fmt_dt(dt: datetime) -> str:
-    return dt.strftime("%d.%m.%Y %H:%M")
-
-def _dow_key(dt: datetime) -> str:
-    # mon..sun
-    return ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][dt.weekday()]
-
-def _parse_hhmm(s: str) -> time:
-    hh, mm = s.strip().split(":")
-    return time(int(hh), int(mm))
-
-def is_working_time(cfg: dict, dt: datetime) -> bool:
-    wh = (cfg or {}).get("working_hours", {}) or {}
-    day = _dow_key(dt)
-    ranges = wh.get(day, []) or []
-    if not ranges:
-        return False
-    t = dt.timetz().replace(tzinfo=None)  # compare naive times
-    for r in ranges:
-        if not isinstance(r, list) or len(r) != 2:
-            continue
-        start = _parse_hhmm(r[0])
-        end = _parse_hhmm(r[1])
-        if start <= t <= end:
-            return True
-    return False
-
-def is_owner(update: Update) -> bool:
-    return update.effective_user is not None and update.effective_user.id == OWNER_ID
+# -------------------- Models --------------------
 
 @dataclass
 class StaffMember:
     user_id: int
-    name: str = ""
-    username: str = ""
+    username: Optional[str] = None
+    name: Optional[str] = None
     active: bool = True
 
-def load_staff() -> Dict[str, StaffMember]:
-    raw = _load_json(STAFF_FILE, {}) or {}
-    out: Dict[str, StaffMember] = {}
-    for k, v in raw.items():
-        try:
-            uid = int(k)
-        except Exception:
-            continue
-        if isinstance(v, dict):
-            out[str(uid)] = StaffMember(
-                user_id=uid,
-                name=str(v.get("name", "") or ""),
-                username=str(v.get("username", "") or "").lstrip("@"),
-                active=bool(v.get("active", True)),
-            )
-    return out
 
-def load_groups() -> Dict[str, dict]:
-    # groups.json format:
-    # {
-    #   "-100123...": {"name":"...", "active": true},
-    #   "-100456...": {"name":"...", "active": false}
-    # }
-    raw = _load_json(GROUPS_FILE, {}) or {}
-    out: Dict[str, dict] = {}
-    for k, v in raw.items():
-        try:
-            gid = int(k)
-        except Exception:
-            continue
-        if isinstance(v, dict):
-            out[str(gid)] = {
-                "id": gid,
-                "name": str(v.get("name", "") or ""),
-                "active": bool(v.get("active", True)),
-            }
-    return out
+@dataclass
+class GroupTarget:
+    chat_id: int
+    name: Optional[str] = None
+    active: bool = True
 
-def load_categories() -> List[dict]:
-    # expected list: [{"key":"psy","label":"..."}]
-    raw = _load_json(CATEGORIES_FILE, []) or []
-    cats = []
-    for it in raw:
-        if isinstance(it, dict) and it.get("key") and it.get("label"):
-            cats.append({"key": str(it["key"]), "label": str(it["label"])})
-    return cats
 
-def load_info() -> dict:
-    # keys: bot_description, ngo_mission, ngo_directions, ngo_contacts
-    return _load_json(INFO_FILE, {}) or {}
+# -------------------- Helpers: file loading --------------------
 
-def load_bot_config() -> dict:
-    return _load_json(BOT_CONFIG_FILE, {}) or {}
+def _load_json(path: str, default: Any) -> Any:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        logger.warning("JSON not found: %s", path)
+        return default
+    except Exception as e:
+        logger.exception("Failed to load JSON %s: %s", path, e)
+        return default
 
-def build_categories_keyboard(categories: List[dict]) -> InlineKeyboardMarkup:
-    kb: List[List[InlineKeyboardButton]] = []
-    for c in categories:
-        kb.append([InlineKeyboardButton(c["label"], callback_data=f"cat:{c['key']}")])
-    kb.append([InlineKeyboardButton("ℹ️ Інформація про бота", callback_data="info:bot")])
-    kb.append([InlineKeyboardButton("ℹ️ Інформація про ГО «Ф1»", callback_data="info:ngo")])
-    kb.append([InlineKeyboardButton("🔁 Змінити анонімність", callback_data="flow:anon")])
-    kb.append([InlineKeyboardButton("❌ Скасувати", callback_data="flow:cancel")])
-    return InlineKeyboardMarkup(kb)
 
-def build_start_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("Почати", callback_data="flow:start")]])
+def load_categories() -> List[Dict[str, str]]:
+    # expected: [{"key":"psy","label":"..."}]
+    cats = _load_json(CATEGORIES_FILE, [])
+    if isinstance(cats, list):
+        return [c for c in cats if isinstance(c, dict) and c.get("key") and c.get("label")]
+    return []
 
-def build_anon_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Так, анонімно", callback_data="anon:yes")],
-        [InlineKeyboardButton("Ні, не анонімно", callback_data="anon:no")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back:start")],
-    ])
 
-def build_ngo_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Місія", callback_data="ngo:mission")],
-        [InlineKeyboardButton("Напрями діяльності", callback_data="ngo:directions")],
-        [InlineKeyboardButton("Контакти", callback_data="ngo:contacts")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back:cats")],
-    ])
+def load_config() -> Dict[str, Any]:
+    # expected keys: timezone, working_hours, messages
+    cfg = _load_json(CONFIG_FILE, {})
+    return cfg if isinstance(cfg, dict) else {}
 
-def build_back_to_ngo_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back:ngo")]])
 
-def build_status_keyboard(case_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+def load_info_texts() -> Dict[str, str]:
+    info = _load_json(INFO_TEXTS_FILE, {})
+    return info if isinstance(info, dict) else {}
+
+
+def load_staff() -> List[StaffMember]:
+    data = _load_json(STAFF_FILE, {})
+    out: List[StaffMember] = []
+    if isinstance(data, dict):
+        for k, v in data.items():
+            try:
+                if not isinstance(v, dict):
+                    continue
+                out.append(
+                    StaffMember(
+                        user_id=int(k),
+                        username=(v.get("username") or None),
+                        name=(v.get("name") or None),
+                        active=bool(v.get("active", True)),
+                    )
+                )
+            except Exception:
+                continue
+    return [m for m in out if m.active]
+
+
+def load_groups() -> List[GroupTarget]:
+    data = _load_json(GROUPS_FILE, {})
+    out: List[GroupTarget] = []
+    if isinstance(data, dict):
+        for k, v in data.items():
+            try:
+                if not isinstance(v, dict):
+                    continue
+                out.append(
+                    GroupTarget(
+                        chat_id=int(k),
+                        name=(v.get("name") or None),
+                        active=bool(v.get("active", True)),
+                    )
+                )
+            except Exception:
+                continue
+    return [g for g in out if g.active]
+
+
+# -------------------- Helpers: runtime data --------------------
+
+def load_runtime_data() -> Dict[str, Any]:
+    return _load_json(DATA_FILE, {"counters": {"ticket": 0}})
+
+
+def save_runtime_data(data: Dict[str, Any]) -> None:
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.exception("Failed to save runtime data: %s", e)
+
+
+def next_ticket_id() -> str:
+    # Example: F1-2025-0001 (local counter)
+    data = load_runtime_data()
+    counters = data.setdefault("counters", {})
+    counters["ticket"] = int(counters.get("ticket", 0)) + 1
+    save_runtime_data(data)
+    year = datetime.utcnow().year
+    return f"F1-{year}-{counters['ticket']:04d}"
+
+
+# -------------------- Helpers: time / messages --------------------
+
+def _parse_hhmm(value: str) -> Optional[time]:
+    try:
+        hh, mm = value.split(":")
+        return time(int(hh), int(mm))
+    except Exception:
+        return None
+
+
+def is_working_time(cfg: Dict[str, Any], now: Optional[datetime] = None) -> bool:
+    # cfg["working_hours"] expected: {"days":[0..6], "start":"09:00", "end":"18:00"}
+    now = now or datetime.now()
+    wh = cfg.get("working_hours") or {}
+    if not isinstance(wh, dict):
+        return True
+    days = wh.get("days")
+    start_s = wh.get("start")
+    end_s = wh.get("end")
+    if not isinstance(days, list) or not start_s or not end_s:
+        return True
+
+    if now.weekday() not in days:
+        return False
+    start_t = _parse_hhmm(start_s)
+    end_t = _parse_hhmm(end_s)
+    if not start_t or not end_t:
+        return True
+    cur = now.time()
+    if start_t <= end_t:
+        return start_t <= cur <= end_t
+    # overnight window
+    return cur >= start_t or cur <= end_t
+
+
+def get_user_reply_text(cfg: Dict[str, Any], working: bool) -> str:
+    msgs = cfg.get("messages") or {}
+    if not isinstance(msgs, dict):
+        return "Дякуємо! Повідомлення передано команді."
+    if working:
+        return msgs.get("working_time_reply") or "Дякуємо! Повідомлення передано команді."
+    return msgs.get("off_time_reply") or "Дякуємо! Ми відповімо у робочий час."
+
+
+# -------------------- Keyboards --------------------
+
+def kb_main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("✅ Взято", callback_data=f"st:{case_id}:taken"),
-            InlineKeyboardButton("⏳ Очікуємо", callback_data=f"st:{case_id}:wait"),
-            InlineKeyboardButton("🏁 Закрито", callback_data=f"st:{case_id}:done"),
+            [InlineKeyboardButton("🟢 Почати", callback_data="menu:start")],
+            [InlineKeyboardButton("📂 Категорії", callback_data="menu:categories")],
+            [
+                InlineKeyboardButton("ℹ️ Про бота", callback_data="menu:about_bot"),
+                InlineKeyboardButton("🏢 Про ГО «Ф1»", callback_data="menu:about_ngo"),
+            ],
         ]
-    ])
-
-# ------------------- Global loaded config (static) -------------------
-
-CATEGORIES = load_categories()
-INFO_TEXTS = load_info()
-BOT_CFG = load_bot_config()
-STAFF = load_staff()
-GROUPS = load_groups()
-
-SHEETS = SheetsLogger(
-    spreadsheet_id=os.environ.get("F1_SHEETS_ID", "").strip(),
-    tab_name=os.environ.get("F1_SHEETS_TAB", "log").strip(),
-    sa_json=os.environ.get("F1_GOOGLE_SA_JSON", "").strip(),
-    sa_file=os.environ.get("F1_GOOGLE_SA_FILE", "").strip(),
-)
-
-# ------------------- UI render helpers -------------------
-
-async def show_start(update_or_q, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
-    text = INFO_TEXTS.get("bot_description", "Вітаю! Це бот ГО «Ф1».")
-    if edit:
-        await update_or_q.edit_message_text(text, reply_markup=build_start_keyboard())
-    else:
-        await update_or_q.message.reply_text(text, reply_markup=build_start_keyboard())
-
-async def show_categories(q, context: ContextTypes.DEFAULT_TYPE):
-    await q.edit_message_text(
-        "Оберіть тему звернення:",
-        reply_markup=build_categories_keyboard(CATEGORIES),
     )
 
-async def show_ngo_menu(q, context: ContextTypes.DEFAULT_TYPE):
-    await q.edit_message_text(
-        "Інформація про ГО «Ф1»:",
-        reply_markup=build_ngo_menu_keyboard(),
+
+def kb_back_to_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Меню", callback_data="menu:home")]])
+
+
+def kb_anon() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Так, анонімно", callback_data="anon:yes"),
+                InlineKeyboardButton("❌ Ні, не анонімно", callback_data="anon:no"),
+            ],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="menu:home")],
+        ]
     )
 
-# ------------------- Commands (no staff/group editing; only viewing) -------------------
+
+def kb_ngo_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🎯 Місія", callback_data="ngo:mission")],
+            [InlineKeyboardButton("🧩 Напрями діяльності", callback_data="ngo:directions")],
+            [InlineKeyboardButton("📞 Контакти", callback_data="ngo:contacts")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="menu:home")],
+        ]
+    )
+
+
+def kb_categories(include_info_buttons: bool = True) -> InlineKeyboardMarkup:
+    cats = load_categories()
+    rows: List[List[InlineKeyboardButton]] = []
+    for c in cats:
+        rows.append([InlineKeyboardButton(c["label"], callback_data=f"cat:{c['key']}")])
+
+    if include_info_buttons:
+        rows.append([InlineKeyboardButton("ℹ️ Інформація про бота", callback_data="menu:about_bot")])
+        rows.append([InlineKeyboardButton("🏢 Інформація про ГО «Ф1»", callback_data="menu:about_ngo")])
+
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _cat_label(cat_key: str) -> str:
+    for c in load_categories():
+        if c.get("key") == cat_key:
+            return c.get("label") or cat_key
+    return cat_key
+
+
+# -------------------- Sheets logger (optional) --------------------
+
+try:
+    from sheets_logger import append_row  # type: ignore
+except Exception:
+    append_row = None  # type: ignore
+
+
+def log_to_sheets(row: List[Any]) -> None:
+    if append_row is None:
+        return
+    try:
+        append_row(row)
+    except Exception as e:
+        logger.exception("Sheets logging failed: %s", e)
+
+
+# -------------------- State helpers --------------------
+
+def reset_user_flow(context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Keep only minimal info
+    context.user_data.pop("anon", None)
+    context.user_data.pop("category", None)
+    context.user_data["stage"] = "menu"
+
+
+def set_stage(context: ContextTypes.DEFAULT_TYPE, stage: str) -> None:
+    context.user_data["stage"] = stage
+
+
+def get_stage(context: ContextTypes.DEFAULT_TYPE) -> str:
+    return str(context.user_data.get("stage") or "menu")
+
+
+# -------------------- Commands --------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # reset flow state
-    context.user_data.setdefault("flow", {})
-    await show_start(update, context, edit=False)
+    reset_user_flow(context)
+    info = load_info_texts()
+    desc = info.get("bot_description") or "🤖 Бот ГО «Ф1». Натисніть «Почати», щоб залишити звернення."
+    await update.message.reply_text(desc, reply_markup=kb_main_menu())
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (
-        "Команди:\n"
-        "/start - почати\n"
-        "/help - довідка\n"
-        "/staff - список співробітників (тільки власник)\n"
-        "/groups - список груп (тільки власник)\n"
-        "/worktime - показати робочий час\n\n"
-        "Надішліть повідомлення - бот передасть його команді."
-    )
-    await update.message.reply_text(txt)
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reset_user_flow(context)
+    await update.message.reply_text("Оберіть дію:", reply_markup=kb_main_menu())
+
 
 async def cmd_staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
+    if OWNER_ID and update.effective_user and update.effective_user.id != OWNER_ID:
         return await update.message.reply_text("Нема доступу.")
-    items = [m for m in STAFF.values() if m.active]
-    if not items:
+    members = load_staff()
+    if not members:
         return await update.message.reply_text("Список співробітників порожній.")
     lines = []
-    for m in sorted(items, key=lambda x: x.user_id):
-        extra = []
-        if m.username:
-            extra.append(f"@{m.username}")
-        if m.name:
-            extra.append(m.name)
-        lines.append(f"- `{m.user_id}` {' '.join(extra)}".strip())
+    for m in sorted(members, key=lambda x: x.user_id):
+        extra = " ".join([f"@{m.username}" if m.username else "", m.name or ""]).strip()
+        lines.append(f"- `{m.user_id}` {extra}".strip())
     await update.message.reply_text("Співробітники:\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
+
 async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
+    if OWNER_ID and update.effective_user and update.effective_user.id != OWNER_ID:
         return await update.message.reply_text("Нема доступу.")
-    items = [g for g in GROUPS.values() if g.get("active")]
-    if not items:
+    gs = load_groups()
+    if not gs:
         return await update.message.reply_text("Список груп порожній.")
     lines = []
-    for g in sorted(items, key=lambda x: int(x["id"])):
-        name = g.get("name") or ""
-        lines.append(f"- `{g['id']}` {name}".strip())
+    for g in sorted(gs, key=lambda x: x.chat_id):
+        nm = f" ({g.name})" if g.name else ""
+        lines.append(f"- `{g.chat_id}`{nm}")
     await update.message.reply_text("Групи:\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
-async def cmd_worktime(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    wh = (BOT_CFG.get("working_hours") or {})
-    await update.message.reply_text("Робочий час (Europe/Kyiv):\n" + json.dumps(wh, ensure_ascii=False, indent=2))
 
-# ------------------- Callback flow -------------------
+# -------------------- Callback handlers --------------------
 
-async def on_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if not q:
+        return
     await q.answer()
+
     data = q.data or ""
+    info = load_info_texts()
+    cfg = load_config()
 
-    if data == "flow:start":
-        context.user_data["anonymous"] = None
-        context.user_data["category_key"] = None
-        context.user_data["category_label"] = None
-        await q.edit_message_text("Бажаєте надіслати звернення анонімно?", reply_markup=build_anon_keyboard())
-        return
+    if data in ("menu:home",):
+        reset_user_flow(context)
+        return await q.edit_message_text("Оберіть дію:", reply_markup=kb_main_menu())
 
-    if data == "flow:anon":
-        await q.edit_message_text("Бажаєте надіслати звернення анонімно?", reply_markup=build_anon_keyboard())
-        return
+    if data == "menu:start":
+        set_stage(context, "anon")
+        return await q.edit_message_text(
+            "Бажаєте залишити звернення анонімно?",
+            reply_markup=kb_anon(),
+        )
 
-    if data == "flow:cancel":
-        context.user_data.clear()
-        await show_start(q, context, edit=True)
-        return
+    if data == "menu:categories":
+        # If anonymity already chosen - show categories; otherwise ask anon first then categories
+        if context.user_data.get("anon") is None:
+            set_stage(context, "anon_then_categories")
+            return await q.edit_message_text(
+                "Бажаєте залишити звернення анонімно?",
+                reply_markup=kb_anon(),
+            )
+        set_stage(context, "category")
+        return await q.edit_message_text("Оберіть категорію звернення:", reply_markup=kb_categories())
 
-async def on_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data or ""
-    if data == "back:start":
-        await show_start(q, context, edit=True)
-        return
-    if data == "back:cats":
-        await show_categories(q, context)
-        return
-    if data == "back:ngo":
-        await show_ngo_menu(q, context)
-        return
+    if data == "menu:about_bot":
+        text = info.get("bot_description") or "🤖 Бот ГО «Ф1»."
+        return await q.edit_message_text(text, reply_markup=kb_back_to_menu())
 
-async def on_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if q.data == "anon:yes":
-        context.user_data["anonymous"] = True
-    else:
-        context.user_data["anonymous"] = False
-    await show_categories(q, context)
+    if data == "menu:about_ngo":
+        # Show NGO submenu
+        return await q.edit_message_text("Інформація про ГО «Ф1». Оберіть розділ:", reply_markup=kb_ngo_menu())
 
-async def on_category_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    key = (q.data or "").split(":", 1)[1] if ":" in (q.data or "") else ""
-    label = None
-    for c in CATEGORIES:
-        if c["key"] == key:
-            label = c["label"]
-            break
-    context.user_data["category_key"] = key
-    context.user_data["category_label"] = label or key
-    await q.edit_message_text(
-        f"Обрано категорію: *{context.user_data['category_label']}*\n\nТепер напишіть повідомлення (можна текст, фото або файл).",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back:cats")]]),
-    )
+    if data.startswith("ngo:"):
+        key = data.split(":", 1)[1]
+        # Support both split keys and legacy "ngo_info"
+        mission = info.get("ngo_mission")
+        directions = info.get("ngo_directions")
+        contacts = info.get("ngo_contacts")
+        legacy = info.get("ngo_info")
 
-async def on_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data or ""
-    if data == "info:bot":
-        txt = INFO_TEXTS.get("bot_description", "Це бот ГО «Ф1».")
-        await q.edit_message_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back:cats")]]))
-        return
-    if data == "info:ngo":
-        await show_ngo_menu(q, context)
-        return
+        if key == "mission":
+            text = mission or legacy or "Місія ГО «Ф1»."
+            return await q.edit_message_text(text, reply_markup=kb_ngo_menu())
+        if key == "directions":
+            text = directions or legacy or "Напрями діяльності ГО «Ф1»."
+            return await q.edit_message_text(text, reply_markup=kb_ngo_menu())
+        if key == "contacts":
+            text = contacts or legacy or "Контакти ГО «Ф1»."
+            return await q.edit_message_text(text, reply_markup=kb_ngo_menu())
 
-async def on_ngo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data or ""
-    if data == "ngo:mission":
-        txt = INFO_TEXTS.get("ngo_mission", "Місія: ...")
-        await q.edit_message_text(txt, reply_markup=build_back_to_ngo_keyboard())
-        return
-    if data == "ngo:directions":
-        txt = INFO_TEXTS.get("ngo_directions", "Напрями діяльності: ...")
-        await q.edit_message_text(txt, reply_markup=build_back_to_ngo_keyboard())
-        return
-    if data == "ngo:contacts":
-        txt = INFO_TEXTS.get("ngo_contacts", "Контакти: ...")
-        await q.edit_message_text(txt, reply_markup=build_back_to_ngo_keyboard())
-        return
+    if data.startswith("anon:"):
+        anon = data.split(":", 1)[1] == "yes"
+        context.user_data["anon"] = anon
 
-# ------------------- Status buttons in group -------------------
+        # Continue flow depending on stage
+        stage = get_stage(context)
+        set_stage(context, "category")
+        return await q.edit_message_text("Оберіть категорію звернення:", reply_markup=kb_categories())
 
-async def on_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data or ""
-    # st:<case_id>:<status>
-    parts = data.split(":")
-    if len(parts) != 3:
-        return
-    case_id, st = parts[1], parts[2]
-    actor = q.from_user.full_name if q.from_user else ""
-    now = _now_local()
-    # log status to sheets
-    SHEETS.log_event({
-        "event": "status",
-        "timestamp": _fmt_dt(now),
-        "case_id": case_id,
-        "status": st,
-        "actor": actor,
-    })
-    try:
-        await q.message.reply_text(f"Статус звернення *{case_id}*: *{st}* (від {actor})", parse_mode=ParseMode.MARKDOWN)
-    except Exception:
-        pass
+    if data.startswith("cat:"):
+        cat_key = data.split(":", 1)[1]
+        context.user_data["category"] = cat_key
+        set_stage(context, "await_message")
+        cat_label = _cat_label(cat_key)
 
-# ------------------- Main routing -------------------
+        return await q.edit_message_text(
+            f"Категорія обрана: *{cat_label}*\n\nНапишіть, будь ласка, ваше повідомлення одним текстом.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("📂 Змінити категорію", callback_data="menu:categories")],
+                    [InlineKeyboardButton("🏠 Меню", callback_data="menu:home")],
+                ]
+            ),
+        )
 
-def _active_group_ids() -> List[int]:
-    ids = []
-    for g in GROUPS.values():
-        if g.get("active"):
-            try:
-                ids.append(int(g["id"]))
-            except Exception:
-                pass
-    return ids
+    # Fallback
+    return await q.edit_message_text("Оберіть дію:", reply_markup=kb_main_menu())
 
-def _active_staff() -> List[StaffMember]:
-    return [m for m in STAFF.values() if m.active]
 
-def _build_header(user, anonymous: bool, category_label: str, case_id: str, dt: datetime) -> str:
-    lines = ["🟦 Нове звернення", f"Категорія: {category_label}", f"ID: {case_id}", f"Час: {_fmt_dt(dt)}"]
-    if anonymous:
-        lines.append("🔒 Анонімне звернення")
-    else:
-        from_line = f"Від: {user.full_name} (id {user.id})"
+# -------------------- Message routing --------------------
+
+def _header_for_message(update: Update, ticket_id: str, cat_key: str, anon: bool) -> str:
+    user = update.effective_user
+    cat_label = _cat_label(cat_key)
+
+    header_lines = [
+        "🟦 Нове звернення (ГО «Ф1»)",
+        f"ID: {ticket_id}",
+        f"Категорія: {cat_label}",
+        f"Анонімно: {'Так' if anon else 'Ні'}",
+    ]
+
+    if not anon and user:
+        line = f"Від: {user.full_name} (id {user.id})"
         if user.username:
-            from_line += f" @{user.username}"
-        lines.append(from_line)
-    return "\n".join(lines)
+            line += f" @{user.username}"
+        header_lines.append(line)
+
+    header_lines.append(f"Час: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC")
+    return "\n".join(header_lines)
+
 
 async def route_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    if not msg or not update.effective_user:
+    if not msg:
         return
 
+    # If user hasn't started flow, show menu to reduce friction
+    stage = get_stage(context)
+    if stage == "menu" and msg.text and msg.text.strip() not in ("/start", "/menu"):
+        # Show menu and don't lose the user's text - but also accept it if we already have category
+        await msg.reply_text("Оберіть дію в меню нижче:", reply_markup=kb_main_menu())
+        return
+
+    # Require category selection before accepting a free-form message
+    cat_key = context.user_data.get("category")
+    anon = bool(context.user_data.get("anon", False))
+
+    if get_stage(context) != "await_message" or not cat_key:
+        await msg.reply_text("Щоб залишити звернення, натисніть «Почати» і оберіть категорію.", reply_markup=kb_main_menu())
+        reset_user_flow(context)
+        return
+
+    ticket_id = next_ticket_id()
+    header = _header_for_message(update, ticket_id, str(cat_key), anon)
+
+    # send to groups
+    groups = load_groups()
+    for g in groups:
+        try:
+            await context.bot.send_message(chat_id=g.chat_id, text=header)
+            await msg.copy(chat_id=g.chat_id)
+        except Exception as e:
+            logger.warning("Failed to forward to group %s: %s", g.chat_id, e)
+
+    # send to staff
+    staff = load_staff()
+    for s in staff:
+        try:
+            await context.bot.send_message(chat_id=s.user_id, text=header)
+            await msg.copy(chat_id=s.user_id)
+        except Exception as e:
+            logger.warning("Failed to forward to staff %s: %s", s.user_id, e)
+
+    # log to sheets
+    cfg = load_config()
+    working = is_working_time(cfg)
     user = update.effective_user
-    dt = _now_local()
+    row = [
+        datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        ticket_id,
+        _cat_label(str(cat_key)),
+        "Так" if anon else "Ні",
+        "" if anon else (user.full_name if user else ""),
+        "" if anon else (f"@{user.username}" if user and user.username else ""),
+        "" if anon else (str(user.id) if user else ""),
+        msg.text or msg.caption or "",
+        "робочий час" if working else "поза робочим часом",
+    ]
+    log_to_sheets(row)
 
-    anonymous = bool(context.user_data.get("anonymous"))
-    category_key = context.user_data.get("category_key") or ""
-    category_label = context.user_data.get("category_label") or (category_key or "Без категорії")
+    # user reply
+    reply_text = get_user_reply_text(cfg, working)
+    await msg.reply_text(reply_text, reply_markup=kb_main_menu())
 
-    # if user hasn't selected category yet, gently prompt
-    if not category_label or category_label == "Без категорії":
-        await msg.reply_text("Будь ласка, натисніть /start і оберіть категорію звернення.")
-        return
+    # reset to menu for next time
+    reset_user_flow(context)
 
-    case_id = uuid.uuid4().hex[:8]
 
-    # ---------- LOG TO SHEETS (immediately) ----------
-    # store minimal text safely (no PII when anonymous)
-    text_preview = ""
-    if msg.text:
-        text_preview = msg.text[:2000]
-    event = {
-        "event": "incoming",
-        "timestamp": _fmt_dt(dt),
-        "case_id": case_id,
-        "anonymous": "yes" if anonymous else "no",
-        "category_key": category_key,
-        "category_label": category_label,
-        "message_type": "text" if msg.text else ("caption" if msg.caption else "media"),
-        "text": ("" if anonymous else text_preview),
-        "user_id": ("" if anonymous else str(user.id)),
-        "username": ("" if anonymous else (user.username or "")),
-        "full_name": ("" if anonymous else user.full_name),
-    }
-    SHEETS.log_event(event)
+# -------------------- Error handler --------------------
 
-    # ---------- ROUTE ----------
-    header = _build_header(user, anonymous, category_label, case_id, dt)
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled error", exc_info=context.error)
 
-    # to groups
-    group_ids = _active_group_ids()
-    for gid in group_ids:
-        try:
-            await context.bot.send_message(chat_id=gid, text=header, reply_markup=build_status_keyboard(case_id))
-            await msg.copy(chat_id=gid)
-        except Exception:
-            # ignore; no spam to user
-            pass
 
-    # to staff DMs
-    for m in _active_staff():
-        try:
-            await context.bot.send_message(chat_id=m.user_id, text=header)
-            await msg.copy(chat_id=m.user_id)
-        except Exception:
-            pass
-
-    # ---------- AUTO-REPLY to user by working time ----------
-    msgs = BOT_CFG.get("messages", {}) or {}
-    if is_working_time(BOT_CFG, dt):
-        reply = msgs.get("in_hours", "Дякуємо! Повідомлення передано команді.")
-    else:
-        reply = msgs.get("out_of_hours", "Дякуємо! Ми отримали звернення поза робочим часом і відповімо в найближчий робочий день.")
-    await msg.reply_text(reply)
-
-# ------------------- Bootstrap -------------------
+# -------------------- Main --------------------
 
 def main():
     if not BOT_TOKEN:
         raise SystemExit("❌ Не задан TELEGRAM_BOT_TOKEN")
-    if OWNER_ID == 0:
-        raise SystemExit("❌ Не задан BOT_OWNER_ID")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # commands
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CommandHandler("staff", cmd_staff))
     app.add_handler(CommandHandler("groups", cmd_groups))
-    app.add_handler(CommandHandler("worktime", cmd_worktime))
 
-    # callbacks (order matters)
-    app.add_handler(CallbackQueryHandler(on_back, pattern=r"^back:(start|cats|ngo)$"))
-    app.add_handler(CallbackQueryHandler(on_flow, pattern=r"^flow:(start|anon|cancel)$"))
-    app.add_handler(CallbackQueryHandler(on_anonymous, pattern=r"^anon:(yes|no)$"))
-    app.add_handler(CallbackQueryHandler(on_category_pick, pattern=r"^cat:"))
-    app.add_handler(CallbackQueryHandler(on_info, pattern=r"^info:"))
-    app.add_handler(CallbackQueryHandler(on_ngo, pattern=r"^ngo:"))
-    app.add_handler(CallbackQueryHandler(on_status, pattern=r"^st:"))
+    app.add_handler(CallbackQueryHandler(on_callback))
 
-    # messages
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, route_incoming))
 
+    app.add_error_handler(on_error)
+
+    # Polling is OK for Railway/Render as long as only one instance runs
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
