@@ -285,7 +285,7 @@ def kb_ngo_menu() -> InlineKeyboardMarkup:
 
 
 def kb_back_to_ngo_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back:ngo_menu")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back:categories")]])
 
 def kb_ticket_actions(ticket_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
