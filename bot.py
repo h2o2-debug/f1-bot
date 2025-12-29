@@ -25,6 +25,9 @@ Files (in repo root):
 
 from __future__ import annotations
 
+import logging
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 import json
 import os
 import logging
