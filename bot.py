@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, time
 from typing import Any, Dict, List, Optional
@@ -309,14 +310,7 @@ def _cat_label(cat_key: str) -> str:
 def allows_anonymous(cat_key: str) -> bool:
     key = (cat_key or "").lower()
     label = (_cat_label(cat_key) or "").strip().lower()
-
-    # Анонімно дозволено тільки для категорії "Інше"
-    if key == "other":
-        return True
-    if label == "інше":
-        return True
-
-    return False
+    return key == "other" or label == "інше"
 
 
 def kb_status(ticket_id: str) -> InlineKeyboardMarkup:
@@ -479,7 +473,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_stage(context, "anon_then_categories")
             return await safe_edit(q, "Бажаєте залишити звернення анонімно?", reply_markup=kb_anon())
         set_stage(context, "category")
-        return await safe_edit(q, "Оберіть категорію звернення:", reply_markup=kb_categories(anon=bool(context.user_data.get("anon", False))))
+        return await safe_edit(
+            q,
+            "Оберіть категорію звернення:",
+            reply_markup=kb_categories(anon=bool(context.user_data.get("anon", False))),
+        )
 
     if data == "menu:about_bot":
         text = info.get("bot_description") or "Бот ГО «Ф1»."
@@ -506,17 +504,33 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         anon = data.split(":", 1)[1] == "yes"
         context.user_data["anon"] = anon
         set_stage(context, "category")
-        return await safe_edit(q, "Оберіть категорію звернення:", reply_markup=kb_categories(anon=bool(context.user_data.get("anon", False))))
+        return await safe_edit(
+            q,
+            "Оберіть категорію звернення:",
+            reply_markup=kb_categories(anon=anon),
+        )
 
     if data.startswith("cat:"):
         cat_key = data.split(":", 1)[1]
         context.user_data["category"] = cat_key
+
+        if context.user_data.get("anon") and not allows_anonymous(cat_key):
+            context.user_data["anon"] = False
+
         set_stage(context, "await_message")
         cat_label = _cat_label(cat_key)
 
+        note = "\n\nМінімальна довжина звернення - 10 символів."
+        if context.user_data.get("anon"):
+            note += (
+                "\n\n⚠️ Ви обрали анонімне звернення."
+                "\nМи не можемо зв’язатися з вами напряму."
+                "\nЯкщо потрібен зворотний зв'язок - залиште контакт у тексті."
+            )
+
         return await safe_edit(
             q,
-            f"Категорія обрана: *{cat_label}*\n\nНапишіть, будь ласка, ваше повідомлення одним текстом.\n\nМінімальна довжина звернення - 10 символів.",
+            f"Категорія обрана: *{cat_label}*\n\nНапишіть, будь ласка, ваше повідомлення одним текстом.{note}",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(
                 [
@@ -560,14 +574,6 @@ async def route_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
 
-    stage = get_stage(context)
-    if stage == "menu" and msg.text and msg.text.strip() not in ("/start", "/menu"):
-        await msg.reply_text("Оберіть дію в меню нижче:", reply_markup=kb_main_menu())
-        return
-
-    cat_key = context.user_data.get("category")
-    anon = bool(context.user_data.get("anon", False))
-
     text = (msg.text or msg.caption or "").strip()
     cleaned = re.sub(r"[^\wА-Яа-яЇїІіЄєҐґ]", "", text)
 
@@ -578,7 +584,15 @@ async def route_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if anon and not allows_anonymous(str(cat_key)):
+    stage = get_stage(context)
+    if stage == "menu" and text not in ("/start", "/menu"):
+        await msg.reply_text("Оберіть дію в меню нижче:", reply_markup=kb_main_menu())
+        return
+
+    cat_key = context.user_data.get("category")
+    anon = bool(context.user_data.get("anon", False))
+
+    if anon and not allows_anonymous(cat_key):
         anon = False
         context.user_data["anon"] = False
 
@@ -598,7 +612,8 @@ async def route_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await msg.copy(chat_id=g.chat_id)
             except Exception:
-                await context.bot.send_message(chat_id=g.chat_id, text=text)
+                if text:
+                    await context.bot.send_message(chat_id=g.chat_id, text=text)
         except Exception as e:
             logger.warning("Failed to forward to group %s: %s", g.chat_id, e)
 
@@ -610,7 +625,8 @@ async def route_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await msg.copy(chat_id=s.user_id)
             except Exception:
-                await context.bot.send_message(chat_id=s.user_id, text=text)
+                if text:
+                    await context.bot.send_message(chat_id=s.user_id, text=text)
         except Exception as e:
             logger.warning("Failed to forward to staff %s: %s", s.user_id, e)
 
