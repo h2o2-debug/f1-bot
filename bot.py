@@ -498,6 +498,12 @@ async def route_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cat_key = context.user_data.get("category")
     anon = bool(context.user_data.get("anon", False))
 
+ if anon:
+    reply_text += ("\n\n❗ Ви обрали анонімне звернення. "
+        "Ми не зможемо зв’язатися з вами напряму. "
+        "Якщо потрібен зворотний зв’язок - залиште контакт у тексті повідомлення "
+        "або зверніться до нас через розділ «Контакти».")
+    
     if get_stage(context) != "await_message" or not cat_key:
         await msg.reply_text("Щоб залишити звернення, натисніть «Почати» і оберіть категорію.", reply_markup=kb_main_menu())
         reset_user_flow(context)
