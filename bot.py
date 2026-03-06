@@ -286,13 +286,15 @@ def kb_ngo_menu() -> InlineKeyboardMarkup:
     )
 
 
-def kb_categories(include_info_buttons: bool = True) -> InlineKeyboardMarkup:
+def kb_categories(include_info_buttons: bool = True, anon: bool = False) -> InlineKeyboardMarkup:
     cats = load_categories()
     rows: List[List[InlineKeyboardButton]] = []
     for c in cats:
+        if anon and not allows_anonymous(c["key"]):
+            continue
         rows.append([InlineKeyboardButton(c["label"], callback_data=f"cat:{c['key']}")])
 
-    if include_info_buttons:
+    if include_info_buttons and not anon:
         rows.append([InlineKeyboardButton("Інформація про бота", callback_data="menu:about_bot")])
         rows.append([InlineKeyboardButton("Інформація про ГО «Ф1»", callback_data="menu:about_ngo")])
 
