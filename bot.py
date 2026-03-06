@@ -334,25 +334,41 @@ def _status_label(code: str) -> str:
 
 # -------------------- Sheets logger (optional) --------------------
 
-try:
-    from sheets_logger import append_row  # type: ignore
-except Exception:
-    append_row = None  # type: ignore
+from sheets_logger import SheetsLogger
 
-if append_row is None:
-    logger.warning("SHEETS: append_row is None")
-else:
-    logger.warning("SHEETS: append_row imported successfully")
+try:
+    SHEETS = SheetsLogger(
+        spreadsheet_id=os.environ.get("F1_SHEETS_ID", "").strip(),
+        tab_name=os.environ.get("F1_SHEETS_TAB", "log").strip(),
+        sa_json=os.environ.get("F1_GOOGLE_SA_JSON", "").strip(),
+        sa_file=os.environ.get("F1_GOOGLE_SA_FILE", "").strip(),
+    )
+    logger.warning("SHEETS: SheetsLogger initialized successfully")
+except Exception as e:
+    SHEETS = None
+    logger.exception("SHEETS: failed to initialize SheetsLogger: %s", e)
 
 
 def log_to_sheets(row: List[Any]) -> None:
-    if append_row is None:
+    if SHEETS is None:
         return
     try:
-        append_row(row)
+        event = {
+            "event": row[0] if len(row) > 0 else "",
+            "case_id": row[1] if len(row) > 1 else "",
+            "category_label": row[2] if len(row) > 2 else "",
+            "anonymous": row[3] if len(row) > 3 else "",
+            "full_name": row[4] if len(row) > 4 else "",
+            "username": row[5] if len(row) > 5 else "",
+            "user_id": row[6] if len(row) > 6 else "",
+            "text": row[7] if len(row) > 7 else "",
+            "message_type": row[8] if len(row) > 8 else "",
+            "status": row[9] if len(row) > 9 else "",
+            "actor": row[10] if len(row) > 10 else "",
+        }
+        SHEETS.log_event(event)
     except Exception as e:
         logger.exception("Sheets logging failed: %s", e)
-
 
 # -------------------- State helpers --------------------
 
