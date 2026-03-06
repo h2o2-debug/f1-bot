@@ -1,13 +1,14 @@
 """Telegram bot for ГО «Ф1».
 
 Key features:
-- Friendly UX: Main menu with buttons
-- Flow: /start -> Menu -> Почати -> Анонімно? -> Категорія -> Повідомлення
-- Extra screens: Про бота, Про ГО «Ф1» (Місія / Напрями діяльності / Контакти)
-- Routing: forwards user messages to active groups and active staff (from JSON files)
+- Main menu with buttons
+- Flow: /start -> Почати -> Анонімно? -> Категорія -> Повідомлення
+- Extra screens: Про бота, Про ГО «Ф1»
+- Routing: forwards messages to active groups and active staff
 - Logging: appends each request to Google Sheets (optional; via sheets_logger.py)
-- Config: categories/messages/working hours/texts are stored in external JSON files
-- Statuses: "Взято / Очікую / Закрито" buttons under ticket header for staff/groups
+- Statuses: "Взято / Очікую / Закрито" buttons under ticket header
+- Anonymous requests allowed only for categories "Насильство" and "Інше"
+- Empty / meaningless messages are rejected
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, time
 from typing import Any, Dict, List, Optional
@@ -29,7 +31,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Conflict, NetworkError
 
 
 # -------------------- Logging --------------------
@@ -216,7 +218,7 @@ def get_user_reply_text(cfg: Dict[str, Any], working: bool) -> str:
     return msgs.get("off_time_reply") or "Дякуємо! Ми відповімо у робочий час."
 
 
-# -------------------- Safe edit helper --------------------
+# -------------------- Safe helpers --------------------
 
 async def safe_edit(q, text: str, reply_markup=None, parse_mode=None) -> None:
     try:
@@ -237,16 +239,13 @@ def _cat_label(cat_key: str) -> str:
 
 
 def allows_anonymous(cat_key: str) -> bool:
-    label = (_cat_label(cat_key) or "").lower()
     key = (cat_key or "").lower()
+    label = (_cat_label(cat_key) or "").strip().lower()
 
-    if key in {"violence", "other", "gbv"}:
+    if key in {"violence", "other"}:
         return True
 
-    if "насиль" in label:
-        return True
-
-    if label.strip() in {"інше", "другое", "other"}:
+    if label in {"насильство", "інше"}:
         return True
 
     return False
@@ -420,6 +419,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data or ""
     info = load_info_texts()
 
+    # ---- STATUS buttons ----
     if data.startswith("st:"):
         parts = data.split(":")
         if len(parts) != 3:
@@ -448,6 +448,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         return
 
+    # ---- MENU / FLOW ----
     if data == "menu:home":
         reset_user_flow(context)
         return await safe_edit(q, "Оберіть дію:", reply_markup=kb_main_menu())
@@ -526,21 +527,21 @@ def _header_for_message(update: Update, ticket_id: str, cat_key: str, anon: bool
     cat_label = _cat_label(cat_key)
 
     header_lines = [
-        "Нове звернення (ГО «Ф1»)",
-        f"ID: {ticket_id}",
-        f"Категорія: {cat_label}",
-        f"Анонімно: {'Так' if anon else 'Ні'}",
+        "🟦 Нове звернення (ГО «Ф1»)",
+        f"🆔 ID: {ticket_id}",
+        f"📂 Категорія: {cat_label}",
+        f"🔒 Анонімно: {'Так' if anon else 'Ні'}",
     ]
 
     if not anon and user:
-        line = f"Від: {user.full_name} (id {user.id})"
+        line = f"👤 Від: {user.full_name} (id {user.id})"
         if user.username:
             line += f" @{user.username}"
         header_lines.append(line)
 
-    header_lines.append(f"Час: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC")
-    header_lines.append("Статус: Очікую")
-    header_lines.append("Відповідальний: -")
+    header_lines.append(f"🕒 Час: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC")
+    header_lines.append("📌 Статус: Очікую")
+    header_lines.append("👥 Відповідальний: -")
     return "\n".join(header_lines)
 
 
@@ -550,9 +551,11 @@ async def route_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = (msg.text or msg.caption or "").strip()
-    if not text:
+    cleaned = re.sub(r"[^\wА-Яа-яЇїІіЄєҐґ]", "", text)
+
+    if not cleaned:
         await msg.reply_text(
-            "❗ Повідомлення не може бути порожнім. Напишіть текст звернення."
+            "❗ Повідомлення не може бути порожнім.\n\nБудь ласка, опишіть ваше звернення одним повідомленням."
         )
         return
 
@@ -563,6 +566,10 @@ async def route_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cat_key = context.user_data.get("category")
     anon = bool(context.user_data.get("anon", False))
+
+    if anon and not allows_anonymous(cat_key):
+        anon = False
+        context.user_data["anon"] = False
 
     if get_stage(context) != "await_message" or not cat_key:
         await msg.reply_text(
@@ -629,7 +636,7 @@ async def route_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_text += (
             "\n\n❗ Ви обрали анонімне звернення."
             "\nМи не зможемо зв’язатися з вами напряму."
-            "\nЯкщо потрібен зворотний зв'язок — залиште контакт у повідомленні"
+            "\nЯкщо потрібен зворотний зв'язок - залиште контакт у повідомленні"
             "\nабо зверніться до нас через контакти ГО «Ф1»."
         )
 
@@ -640,6 +647,9 @@ async def route_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -------------------- Error handler --------------------
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if isinstance(context.error, NetworkError):
+        logger.warning("NetworkError: %s", context.error)
+        return
     logger.exception("Unhandled error", exc_info=context.error)
 
 
@@ -660,7 +670,25 @@ def main():
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, route_incoming))
 
     app.add_error_handler(on_error)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    while True:
+        try:
+            app.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+            )
+        except Conflict:
+            logger.warning("Conflict getUpdates: waiting 10s and retrying...")
+            import time as _time
+            _time.sleep(10)
+        except NetworkError as e:
+            logger.warning("NetworkError (%s): waiting 10s and retrying...", e)
+            import time as _time
+            _time.sleep(10)
+        except Exception as e:
+            logger.exception("Fatal error: %s. Waiting 10s and retrying...", e)
+            import time as _time
+            _time.sleep(10)
 
 
 if __name__ == "__main__":
