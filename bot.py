@@ -339,6 +339,11 @@ try:
 except Exception:
     append_row = None  # type: ignore
 
+if append_row is None:
+    logger.warning("SHEETS: append_row is None")
+else:
+    logger.warning("SHEETS: append_row imported successfully")
+
 
 def log_to_sheets(row: List[Any]) -> None:
     if append_row is None:
