@@ -1,98 +1,114 @@
-# sheets_logger.py
-# Minimal Google Sheets appender for logging bot events.
-
 import os
 import json
-from typing import Dict, Any, List, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
 
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+
 class SheetsLogger:
-    """
-    Append events to a Google Sheet tab.
-
-    You must:
-    - enable Google Sheets API
-    - create a Service Account
-    - share the spreadsheet with service account email as Editor
-
-    Provide credentials either:
-    - env F1_GOOGLE_SA_JSON (full JSON content)
-    - env F1_GOOGLE_SA_FILE (path to JSON file in runtime)
-    """
-    def __init__(self, spreadsheet_id: str, tab_name: str, sa_json: str = "", sa_file: str = ""):
+    def __init__(
+        self,
+        spreadsheet_id: str,
+        tab_name: str = "log",
+        sa_json: str = "",
+        sa_file: str = "",
+    ):
         self.spreadsheet_id = spreadsheet_id
-        self.tab_name = tab_name or "log"
-        self.sa_json = sa_json
-        self.sa_file = sa_file
-        self._service = None
+        self.tab_name = tab_name
 
-    def _get_service(self):
-        if self._service is not None:
-            return self._service
+        creds = None
 
-        if not self.spreadsheet_id:
-            return None
+        if sa_json:
+            info = json.loads(sa_json)
+            creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+        elif sa_file:
+            creds = Credentials.from_service_account_file(sa_file, scopes=SCOPES)
+        else:
+            raise ValueError("No Google service account credentials provided")
 
-        info = None
-        if self.sa_json:
-            try:
-                info = json.loads(self.sa_json)
-            except Exception:
-                info = None
-        if info is None and self.sa_file:
-            try:
-                with open(self.sa_file, "r", encoding="utf-8") as f:
-                    info = json.load(f)
-            except Exception:
-                info = None
-        if info is None:
-            # no credentials - silently disable
-            return None
-
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        creds = Credentials.from_service_account_info(info, scopes=scopes)
-        self._service = build("sheets", "v4", credentials=creds, cache_discovery=False)
-        return self._service
+        self.service = build("sheets", "v4", credentials=creds)
 
     def log_event(self, event: Dict[str, Any]) -> None:
-        """
-        Append one row. This method must never crash the bot.
-        """
-        try:
-            service = self._get_service()
-            if service is None:
-                return
+        row = [
+            datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            event.get("event", ""),
+            event.get("case_id", ""),
+            event.get("anonymous", ""),
+            event.get("category_key", ""),
+            event.get("category_label", ""),
+            event.get("message_type", ""),
+            event.get("text", ""),
+            event.get("user_id", ""),
+            event.get("username", ""),
+            event.get("full_name", ""),
+            event.get("status", ""),
+            event.get("actor", ""),
+        ]
 
-            # Define column order (stable)
-            cols = [
-                "event",
-                "timestamp",
-                "case_id",
-                "anonymous",
-                "category_key",
-                "category_label",
-                "message_type",
-                "text",
-                "user_id",
-                "username",
-                "full_name",
-                "status",
-                "actor",
-            ]
-            row = [str(event.get(k, "")) for k in cols]
+        body = {"values": [row]}
 
-            body = {"values": [row]}
-            rng = f"{self.tab_name}!A1"
-            service.spreadsheets().values().append(
-                spreadsheetId=self.spreadsheet_id,
-                range=rng,
-                valueInputOption="RAW",
-                insertDataOption="INSERT_ROWS",
-                body=body,
-            ).execute()
-        except Exception:
-            # intentionally swallow errors to avoid bot downtime
-            return
+        self.service.spreadsheets().values().append(
+            spreadsheetId=self.spreadsheet_id,
+            range=f"{self.tab_name}!A1",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body=body,
+        ).execute()
+
+
+# --- compatibility wrapper for bot.py ---
+
+_logger_instance: Optional[SheetsLogger] = None
+
+
+def _get_logger() -> Optional[SheetsLogger]:
+    global _logger_instance
+
+    if _logger_instance is not None:
+        return _logger_instance
+
+    spreadsheet_id = os.environ.get("F1_SHEETS_ID", "").strip()
+    tab_name = os.environ.get("F1_SHEETS_TAB", "log").strip()
+    sa_json = os.environ.get("F1_GOOGLE_SA_JSON", "").strip()
+    sa_file = os.environ.get("F1_GOOGLE_SA_FILE", "").strip()
+
+    if not spreadsheet_id:
+        return None
+
+    try:
+        _logger_instance = SheetsLogger(
+            spreadsheet_id=spreadsheet_id,
+            tab_name=tab_name,
+            sa_json=sa_json,
+            sa_file=sa_file,
+        )
+        return _logger_instance
+    except Exception:
+        return None
+
+
+def append_row(row: List[Any]) -> None:
+    logger = _get_logger()
+    if logger is None:
+        return
+
+    event = {
+        "event": row[0] if len(row) > 0 else "",
+        "case_id": row[1] if len(row) > 1 else "",
+        "category_label": row[2] if len(row) > 2 else "",
+        "anonymous": row[3] if len(row) > 3 else "",
+        "full_name": row[4] if len(row) > 4 else "",
+        "username": row[5] if len(row) > 5 else "",
+        "user_id": row[6] if len(row) > 6 else "",
+        "text": row[7] if len(row) > 7 else "",
+        "message_type": row[8] if len(row) > 8 else "",
+        "status": row[9] if len(row) > 9 else "",
+        "actor": row[10] if len(row) > 10 else "",
+    }
+
+    logger.log_event(event)
