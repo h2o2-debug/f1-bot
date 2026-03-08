@@ -451,26 +451,39 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     info = load_info_texts()
 
     # ---- STATUS buttons ----
-    if data.startswith("st:"):
-        # st:<ticket>:<code>
-        parts = data.split(":")
-        if len(parts) != 3:
-            return
-        ticket_id, code = parts[1], parts[2]
+  if data.startswith("st:"):
+    parts = data.split(":")
+    if len(parts) != 3:
+        return
+    ticket_id, code = parts[1], parts[2]
 
-        user = update.effective_user
-        if not user or not is_staff_user(user.id):
-            return  # silent ignore
+    user = update.effective_user
+    if not user or not is_staff_user(user.id):
+        return
 
-        status = _status_label(code)
-        who = user.full_name
-        if user.username:
-            who += f" (@{user.username})"
+    status = _status_label(code)
+    who = user.full_name
+    if user.username:
+        who += f" (@{user.username})"
 
-        new_text = _apply_status_to_header(q.message.text or "", status, who)
+    new_text = _apply_status_to_header(q.message.text or "", status, who)
+    await safe_edit(q, new_text, reply_markup=kb_status(ticket_id))
 
-        await safe_edit(q, new_text, reply_markup=kb_status(ticket_id))
-
+    log_to_sheets([
+        datetime.utcnow().isoformat(timespec="seconds") + "Z",   # timestamp
+        "",                                                      # user_id
+        "",                                                      # username
+        who,                                                     # full_name
+        "",                                                      # is_anonymous
+        "",                                                      # category
+        ticket_id,                                               # case_id
+        "status",                                                # message_type
+        "",                                                      # message_text
+        "",                                                      # attachments
+        status.lower(),                                          # status
+        who,                                                     # source
+    ])
+    return
         # Log to sheets: STATUS change
         log_to_sheets([
             datetime.utcnow().isoformat(timespec="seconds") + "Z",
@@ -657,19 +670,20 @@ async def route_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg = load_config()
     working = is_working_time(cfg)
     user = update.effective_user
-    row = [
-        datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "REQUEST",
-        ticket_id,
-        _cat_label(str(cat_key)),
-        "Так" if anon else "Ні",
-        "" if anon else (user.full_name if user else ""),
-        "" if anon else (f"@{user.username}" if user and user.username else ""),
-        "" if anon else (str(user.id) if user else ""),
-        text,
-        "робочий час" if working else "поза робочим часом",
-        "Очікую",
-    ]
+row = [
+    datetime.utcnow().isoformat(timespec="seconds") + "Z",   # timestamp
+    "" if anon else (str(user.id) if user else ""),          # user_id
+    "" if anon else (f"@{user.username}" if user and user.username else ""),  # username
+    "" if anon else (user.full_name if user else ""),        # full_name
+    "yes" if anon else "no",                                 # is_anonymous
+    _cat_label(str(cat_key)),                                # category
+    ticket_id,                                               # case_id
+    "text",                                                  # message_type
+    text,                                                    # message_text
+    "",                                                      # attachments
+    "wait",                                                  # status
+    "бот Ф1",                                                # source
+]
     log_to_sheets(row)
 
     reply_text = get_user_reply_text(cfg, working)
