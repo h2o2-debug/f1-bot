@@ -354,22 +354,22 @@ def log_to_sheets(row: List[Any]) -> None:
         return
     try:
         event = {
-            "event": row[0] if len(row) > 0 else "",
-            "case_id": row[1] if len(row) > 1 else "",
-            "category_label": row[2] if len(row) > 2 else "",
-            "anonymous": row[3] if len(row) > 3 else "",
-            "full_name": row[4] if len(row) > 4 else "",
-            "username": row[5] if len(row) > 5 else "",
-            "user_id": row[6] if len(row) > 6 else "",
-            "text": row[7] if len(row) > 7 else "",
-            "message_type": row[8] if len(row) > 8 else "",
-            "status": row[9] if len(row) > 9 else "",
-            "actor": row[10] if len(row) > 10 else "",
+            "timestamp": row[0] if len(row) > 0 else "",
+            "user_id": row[1] if len(row) > 1 else "",
+            "username": row[2] if len(row) > 2 else "",
+            "full_name": row[3] if len(row) > 3 else "",
+            "is_anonymous": row[4] if len(row) > 4 else "",
+            "category": row[5] if len(row) > 5 else "",
+            "case_id": row[6] if len(row) > 6 else "",
+            "message_type": row[7] if len(row) > 7 else "",
+            "message_text": row[8] if len(row) > 8 else "",
+            "attachments": row[9] if len(row) > 9 else "",
+            "status": row[10] if len(row) > 10 else "",
+            "source": row[11] if len(row) > 11 else "",
         }
         SHEETS.log_event(event)
     except Exception as e:
         logger.exception("Sheets logging failed: %s", e)
-
 # -------------------- State helpers --------------------
 
 def reset_user_flow(context: ContextTypes.DEFAULT_TYPE) -> None:
