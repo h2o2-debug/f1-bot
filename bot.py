@@ -451,7 +451,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     info = load_info_texts()
 
     # ---- STATUS buttons ----
-  if data.startswith("st:"):
+    if data.startswith("st:"):
     parts = data.split(":")
     if len(parts) != 3:
         return
@@ -670,7 +670,7 @@ async def route_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg = load_config()
     working = is_working_time(cfg)
     user = update.effective_user
-row = [
+    row = [
     datetime.utcnow().isoformat(timespec="seconds") + "Z",   # timestamp
     "" if anon else (str(user.id) if user else ""),          # user_id
     "" if anon else (f"@{user.username}" if user and user.username else ""),  # username
