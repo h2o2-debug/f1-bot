@@ -353,23 +353,20 @@ def log_to_sheets(row: List[Any]) -> None:
     if SHEETS is None:
         return
     try:
-        event = {
-            "timestamp": row[0] if len(row) > 0 else "",
-            "user_id": row[1] if len(row) > 1 else "",
-            "username": row[2] if len(row) > 2 else "",
-            "full_name": row[3] if len(row) > 3 else "",
-            "is_anonymous": row[4] if len(row) > 4 else "",
-            "category": row[5] if len(row) > 5 else "",
-            "case_id": row[6] if len(row) > 6 else "",
-            "message_type": row[7] if len(row) > 7 else "",
-            "message_text": row[8] if len(row) > 8 else "",
-            "attachments": row[9] if len(row) > 9 else "",
-            "status": row[10] if len(row) > 10 else "",
-            "source": row[11] if len(row) > 11 else "",
-        }
-        SHEETS.log_event(event)
+        service = SHEETS._get_service()
+        if service is None:
+            return
+        body = {"values": [[str(x) for x in row]]}
+        service.spreadsheets().values().append(
+            spreadsheetId=SHEETS.spreadsheet_id,
+            range=f"{SHEETS.tab_name}!A1",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body=body,
+        ).execute()
     except Exception as e:
         logger.exception("Sheets logging failed: %s", e)
+
 # -------------------- State helpers --------------------
 
 def reset_user_flow(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -452,46 +449,36 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---- STATUS buttons ----
     if data.startswith("st:"):
-    parts = data.split(":")
-    if len(parts) != 3:
-        return
-    ticket_id, code = parts[1], parts[2]
+        parts = data.split(":")
+        if len(parts) != 3:
+            return
+        ticket_id, code = parts[1], parts[2]
 
-    user = update.effective_user
-    if not user or not is_staff_user(user.id):
-        return
+        user = update.effective_user
+        if not user or not is_staff_user(user.id):
+            return
 
-    status = _status_label(code)
-    who = user.full_name
-    if user.username:
-        who += f" (@{user.username})"
+        status = _status_label(code)
+        who = user.full_name
+        if user.username:
+            who += f" (@{user.username})"
 
-    new_text = _apply_status_to_header(q.message.text or "", status, who)
-    await safe_edit(q, new_text, reply_markup=kb_status(ticket_id))
+        new_text = _apply_status_to_header(q.message.text or "", status, who)
+        await safe_edit(q, new_text, reply_markup=kb_status(ticket_id))
 
-    log_to_sheets([
-        datetime.utcnow().isoformat(timespec="seconds") + "Z",   # timestamp
-        "",                                                      # user_id
-        "",                                                      # username
-        who,                                                     # full_name
-        "",                                                      # is_anonymous
-        "",                                                      # category
-        ticket_id,                                               # case_id
-        "status",                                                # message_type
-        "",                                                      # message_text
-        "",                                                      # attachments
-        status.lower(),                                          # status
-        who,                                                     # source
-    ])
-    return
-        # Log to sheets: STATUS change
         log_to_sheets([
             datetime.utcnow().isoformat(timespec="seconds") + "Z",
-            "STATUS",
-            ticket_id,
-            status,
+            "",
+            "",
             who,
-            str(user.id),
+            "",
+            "",
+            ticket_id,
+            "status",
+            "",
+            "",
+            status.lower(),
+            who,
         ])
         return
 
@@ -671,19 +658,19 @@ async def route_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
     working = is_working_time(cfg)
     user = update.effective_user
     row = [
-    datetime.utcnow().isoformat(timespec="seconds") + "Z",   # timestamp
-    "" if anon else (str(user.id) if user else ""),          # user_id
-    "" if anon else (f"@{user.username}" if user and user.username else ""),  # username
-    "" if anon else (user.full_name if user else ""),        # full_name
-    "yes" if anon else "no",                                 # is_anonymous
-    _cat_label(str(cat_key)),                                # category
-    ticket_id,                                               # case_id
-    "text",                                                  # message_type
-    text,                                                    # message_text
-    "",                                                      # attachments
-    "wait",                                                  # status
-    "бот Ф1",                                                # source
-]
+        datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "" if anon else (str(user.id) if user else ""),
+        "" if anon else (f"@{user.username}" if user and user.username else ""),
+        "" if anon else (user.full_name if user else ""),
+        "yes" if anon else "no",
+        _cat_label(str(cat_key)),
+        ticket_id,
+        "text",
+        text,
+        "",
+        "wait",
+        "бот Ф1",
+    ]
     log_to_sheets(row)
 
     reply_text = get_user_reply_text(cfg, working)
